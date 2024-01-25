@@ -1843,6 +1843,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dao-proposal-incentives"
+version = "2.4.0"
+dependencies = [
+ "cosmwasm-schema",
+ "cosmwasm-std",
+ "cw-multi-test",
+ "cw-storage-plus 1.2.0",
+ "cw-utils 1.0.3",
+ "cw2 1.1.2",
+ "cw20-base 1.1.2",
+ "dao-dao-core",
+ "dao-hooks",
+ "dao-interface",
+ "dao-voting 2.4.0",
+ "thiserror",
+]
+
+[[package]]
 name = "dao-proposal-multiple"
 version = "2.4.0"
 dependencies = [
@@ -2126,6 +2144,24 @@ dependencies = [
  "osmosis-std",
  "osmosis-test-tube",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "dao-voting-incentives"
+version = "2.4.0"
+dependencies = [
+ "cosmwasm-schema",
+ "cosmwasm-std",
+ "cw-multi-test",
+ "cw-storage-plus 1.2.0",
+ "cw-utils 1.0.3",
+ "cw2 1.1.2",
+ "cw20-base 1.1.2",
+ "dao-dao-core",
+ "dao-hooks",
+ "dao-interface",
+ "dao-voting 2.4.0",
  "thiserror",
 ]
 
