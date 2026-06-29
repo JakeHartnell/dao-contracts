@@ -18,26 +18,20 @@ The DAO now owns the ABC. The supply token is registered as the DAO's voting tok
 
 ## Authentication
 
-The factory has no `owner` and is freely callable by any address. To prevent an impostor "voting module" from spoofing the DAO relationship and having a freshly-minted ABC's ownership transferred to an attacker-chosen address, the factory uses a **reverse handshake** at the top of `execute_token_factory_factory`:
+The factory has no `owner` and is freely callable by any address. To prevent EOAs or arbitrary contracts from spawning DAO-owned ABCs, `execute_token_factory_factory` authenticates the caller as a DAO DAO `dao-voting-token-staked` contract before trusting its `Dao {}` response:
 
 ```rust
-// 1. Ask the alleged voting module which DAO it belongs to.
+// 1. Require the caller to expose the token-staked voting module identity.
+let info: InfoResponse = querier.query_wasm_smart(&info.sender, &VotingModuleQueryMsg::Info {})?;
+ensure!(info.info.contract == "crates.io:dao-voting-token-staked", Unauthorized {});
+
+// 2. Ask that voting module which DAO should receive ABC ownership.
 let dao: Addr = querier.query_wasm_smart(&info.sender, &VotingModuleQueryMsg::Dao {})?;
-
-// 2. Ask that DAO which contract it considers its voting module.
-let claimed_voting_module: Addr =
-    querier.query_wasm_smart(&dao, &DaoQueryMsg::VotingModule {})?;
-
-// 3. Reject unless the round trip closes.
-ensure!(
-    claimed_voting_module == info.sender,
-    ContractError::Unauthorized {}
-);
 ```
 
-This admits any contract that is genuinely a DAO's voting module (its DAO will name it as the voting module on its end), while rejecting impostor contracts that respond to `VotingModuleQueryMsg::Dao` with an attacker-chosen DAO address.
+This admits DAO DAO token-staked voting modules during DAO instantiation. A full reverse DAO → voting-module handshake cannot run at this point because `dao-dao-core` only saves the voting module address after the voting module instantiate reply succeeds.
 
-This pattern was added 2026-05-09 as part of the cw-abc audit revival (finding C-2). The same pattern is applied to `dao-test-custom-factory`'s analogous handlers.
+This pattern was added 2026-05-09 as part of the cw-abc audit revival (finding C-2). The analogous `dao-test-custom-factory` remains looser because some generic factory tests instantiate voting modules directly from EOAs.
 
 ## State
 

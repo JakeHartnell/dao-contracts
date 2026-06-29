@@ -19,11 +19,48 @@ gen-schema:
 integration-test: deploy-local workspace-optimize
 	RUST_LOG=info CONFIG={{orc_config}} cargo integration-test
 
-test-tube:
+test-tube: download-deps workspace-optimize abc-test-tube-wasms
     cargo test --features "test-tube"
 
 test-tube-dev: workspace-optimize
     cargo test --features "test-tube"
+
+abc-test-tube-wasms:
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p artifacts
+    cargo_cmd=(cargo)
+    if cargo +nightly-2024-01-08 --version >/dev/null 2>&1; then
+        cargo_cmd=(cargo +nightly-2024-01-08)
+    elif [[ -d "${CARGO_HOME%/.cargo}/.rustup" ]] && RUSTUP_HOME="${CARGO_HOME%/.cargo}/.rustup" cargo +1.78.0 --version >/dev/null 2>&1; then
+        export RUSTUP_HOME="${CARGO_HOME%/.cargo}/.rustup"
+        cargo_cmd=(cargo +1.78.0)
+    fi
+
+    # Build each contract separately so dependency feature unification cannot
+    # enable the `library` feature on the artifact being stored in test-tube.
+    RUSTFLAGS='-C link-arg=-s -C link-arg=--allow-undefined -C target-feature=-sign-ext,-bulk-memory' "${cargo_cmd[@]}" build -p cw-tokenfactory-issuer --release --target wasm32-unknown-unknown --no-default-features --features osmosis_tokenfactory
+    cp target/wasm32-unknown-unknown/release/cw_tokenfactory_issuer.wasm artifacts/cw_tokenfactory_issuer-osmosis.wasm
+    RUSTFLAGS='-C link-arg=-s -C link-arg=--allow-undefined -C target-feature=-sign-ext,-bulk-memory' "${cargo_cmd[@]}" build -p cw-abc --release --target wasm32-unknown-unknown --no-default-features --features osmosis_tokenfactory
+    cp target/wasm32-unknown-unknown/release/cw_abc.wasm artifacts/cw_abc.wasm
+    RUSTFLAGS='-C link-arg=-s -C link-arg=--allow-undefined -C target-feature=-sign-ext,-bulk-memory' "${cargo_cmd[@]}" build -p dao-abc-factory --release --target wasm32-unknown-unknown --no-default-features --features osmosis_tokenfactory
+    cp target/wasm32-unknown-unknown/release/dao_abc_factory.wasm artifacts/dao_abc_factory.wasm
+    RUSTFLAGS='-C link-arg=-s -C link-arg=--allow-undefined -C target-feature=-sign-ext,-bulk-memory' "${cargo_cmd[@]}" build -p dao-voting-token-staked --release --target wasm32-unknown-unknown --no-default-features --features osmosis_tokenfactory
+    cp target/wasm32-unknown-unknown/release/dao_voting_token_staked.wasm artifacts/dao_voting_token_staked.wasm
+    RUSTFLAGS='-C link-arg=-s -C link-arg=--allow-undefined -C target-feature=-sign-ext,-bulk-memory' "${cargo_cmd[@]}" build -p dao-proposal-single@2.8.0-alpha.2 --release --target wasm32-unknown-unknown
+    cp target/wasm32-unknown-unknown/release/dao_proposal_single.wasm artifacts/dao_proposal_single.wasm
+    RUSTFLAGS='-C link-arg=-s -C link-arg=--allow-undefined -C target-feature=-sign-ext,-bulk-memory' "${cargo_cmd[@]}" build -p dao-dao-core@2.8.0-alpha.2 --release --target wasm32-unknown-unknown
+    cp target/wasm32-unknown-unknown/release/dao_dao_core.wasm artifacts/dao_dao_core.wasm
+
+    # osmosis-test-tube's VM is older than current Rust/LLVM wasm defaults.
+    # Lower sign-extension opcodes after build so local test-tube matches CI's
+    # optimizer-compatible artifact shape.
+    wasm-opt --enable-bulk-memory --signext-lowering artifacts/cw_tokenfactory_issuer-osmosis.wasm -o artifacts/cw_tokenfactory_issuer-osmosis.wasm
+    wasm-opt --enable-bulk-memory --signext-lowering artifacts/cw_abc.wasm -o artifacts/cw_abc.wasm
+    wasm-opt --enable-bulk-memory --signext-lowering artifacts/dao_abc_factory.wasm -o artifacts/dao_abc_factory.wasm
+    wasm-opt --enable-bulk-memory --signext-lowering artifacts/dao_voting_token_staked.wasm -o artifacts/dao_voting_token_staked.wasm
+    wasm-opt --enable-bulk-memory --signext-lowering artifacts/dao_proposal_single.wasm -o artifacts/dao_proposal_single.wasm
+    wasm-opt --enable-bulk-memory --signext-lowering artifacts/dao_dao_core.wasm -o artifacts/dao_dao_core.wasm
 
 integration-test-dev test_name="":
 	SKIP_CONTRACT_STORE=true RUST_LOG=info CONFIG='{{`pwd`}}/ci/configs/cosm-orc/local.yaml' cargo integration-test {{test_name}}
@@ -62,7 +99,7 @@ download-deps:
 
 workspace-optimize:
     #!/bin/bash
-    if [[ $(uname -m) == 'arm64' ]] || [ $(uname -m) == 'aarch64' ]]; then docker run --rm -v "$(pwd)":/code \
+    if [[ $(uname -m) == 'arm64' ]] || [[ $(uname -m) == 'aarch64' ]]; then docker run --rm -v "$(pwd)":/code \
             --mount type=volume,source="$(basename "$(pwd)")_cache",target=/target \
             --mount type=volume,source=registry_cache,target=/usr/local/cargo/registry \
             --platform linux/arm64 \

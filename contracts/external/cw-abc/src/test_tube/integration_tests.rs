@@ -551,12 +551,15 @@ fn test_update_curve() {
         ))
     );
 
+    abc.execute(&ExecuteMsg::Close {}, &[], &accounts[0])
+        .unwrap();
+
     // Owner updates curve
     abc.execute(
         &ExecuteMsg::UpdateCurve {
-            curve_type: CurveType::Linear {
-                slope: Uint128::new(2),
-                scale: 5,
+            curve_type: CurveType::Constant {
+                value: Uint128::one(),
+                scale: 1,
             },
         },
         &[],

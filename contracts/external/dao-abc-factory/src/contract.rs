@@ -12,8 +12,9 @@ use cw_abc::msg::{
 use cw_storage_plus::{Bound, Item, Map};
 use cw_utils::parse_reply_instantiate_data;
 use dao_interface::{
-    msg::QueryMsg as DaoQueryMsg, state::ModuleInstantiateCallback, token::TokenFactoryCallback,
-    voting::Query as VotingModuleQueryMsg,
+    state::ModuleInstantiateCallback,
+    token::TokenFactoryCallback,
+    voting::{InfoResponse, Query as VotingModuleQueryMsg},
 };
 
 use crate::{
@@ -26,6 +27,7 @@ const CONTRACT_NAME: &str = "crates.io:dao-abc-factory";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const INSTANTIATE_ABC_REPLY_ID: u64 = 1;
+const DAO_VOTING_TOKEN_STAKED_CONTRACT: &str = "crates.io:dao-voting-token-staked";
 
 const DAOS: Map<Addr, Empty> = Map::new("daos");
 const CURRENT_DAO: Item<Addr> = Item::new("current_dao");
@@ -65,23 +67,23 @@ pub fn execute_token_factory_factory(
     code_id: u64,
     msg: AbcInstantiateMsg,
 ) -> Result<Response, ContractError> {
-    // Reverse-handshake authentication: the caller (info.sender) claims to
-    // be a DAO's voting module. We accept the claim only if (a) the caller
-    // responds to `VotingModuleQueryMsg::Dao` with some DAO address, and
-    // (b) that DAO responds to `QueryMsg::VotingModule` with the caller's
-    // address. This closes the impostor-voting-module attack where any
-    // contract could spoof the relationship and have ownership transferred
-    // to an attacker-chosen address.
+    // Authenticate the caller as a DAO DAO token-staked voting module. During
+    // DAO creation the DAO core has not saved its voting module address until
+    // the voting-module instantiate reply finishes, so a reverse DAO -> voting
+    // module handshake cannot succeed here. Instead, require the caller to
+    // expose the token-staked voting module contract identity, then ask it for
+    // the DAO address that will receive ownership of the ABC.
+    let info_response: InfoResponse = deps
+        .querier
+        .query_wasm_smart(&info.sender, &VotingModuleQueryMsg::Info {})?;
+    ensure!(
+        info_response.info.contract == DAO_VOTING_TOKEN_STAKED_CONTRACT,
+        ContractError::Unauthorized {}
+    );
+
     let dao: Addr = deps
         .querier
         .query_wasm_smart(&info.sender, &VotingModuleQueryMsg::Dao {})?;
-    let claimed_voting_module: Addr = deps
-        .querier
-        .query_wasm_smart(&dao, &DaoQueryMsg::VotingModule {})?;
-    ensure!(
-        claimed_voting_module == info.sender,
-        ContractError::Unauthorized {}
-    );
 
     // Save voting module address
     VOTING_MODULE.save(deps.storage, &info.sender)?;
