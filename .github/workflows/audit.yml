@@ -1,12 +1,38 @@
-name: Cargo audit
+name: Cargo dependency policy
+
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/audit.yml"
+      - "**/Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/audit.yml"
+      - "**/Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: read
+
 jobs:
-  audit:
-    runs-on: ubuntu-latest
+  dependency-policy:
+    name: Security, licenses, and sources
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v1
-      - uses: actions-rs/audit-check@v1
+      - name: Checkout sources
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Enforce production dependency policy
+        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          rust-version: "1.81.0"
+          arguments: ""
+          command: check advisories licenses sources
+          command-arguments: --exclude-dev --hide-inclusion-graph

@@ -1,0 +1,9 @@
+Portions of this package were extracted from the WyndDAO gauge protocol.
+
+WyndDAO: Smart contracts for the $WYND token and Wynd DAO
+Copyright (C) 2022 Cosmorama
+
+Imported into DAO DAO in commit 7b5813cf0f354396143dbc86485ca5ed93809a4b
+and subsequently modified by DAO DAO contributors.
+
+Licensed under the Apache License, Version 2.0.

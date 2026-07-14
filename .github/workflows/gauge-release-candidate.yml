@@ -1,0 +1,46 @@
+name: Gauge optimized release candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Optimized Wasm candidate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build with pinned optimizer image and Rust
+        run: scripts/build-gauge-release.sh artifacts/gauges
+
+      - name: Install pinned CosmWasm validator
+        run: cargo install cosmwasm-check --version 1.5.11 --locked
+
+      - name: Validate optimized artifacts
+        run: |
+          cosmwasm-check \
+            artifacts/gauges/gauge_orchestrator.wasm \
+            artifacts/gauges/gauge_adapter.wasm \
+            artifacts/gauges/gauge_budget_allocator.wasm
+          scripts/validate-gauge-wasm.sh artifacts/gauges
+
+      - name: Assert release-candidate provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e artifacts/gauges/BUILD_NOT_FOR_RELEASE
+          grep -Fx "source_commit=${GITHUB_SHA}" artifacts/gauges/build-provenance.txt
+          grep -Fx "optimizer_image=cosmwasm/optimizer@sha256:7e0b9229c1a4118d0c9a2af2e7f5d95a91f264c26a2ce5681c779926e74d7f85" artifacts/gauges/build-provenance.txt
+          grep -Fx "rust_toolchain=1.81.0" artifacts/gauges/build-provenance.txt
+          grep -Fx "dirty_worktree=0" artifacts/gauges/build-provenance.txt
+
+      - name: Upload optimized candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gauge-optimized-${{ github.sha }}
+          if-no-files-found: error
+          path: artifacts/gauges/

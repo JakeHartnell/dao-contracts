@@ -1,0 +1,34 @@
+[graph]
+targets = ["wasm32-unknown-unknown"]
+all-features = false
+exclude = [
+  "bootstrap-env",
+  "dao-migrator",
+  "dao-testing",
+  "integration-tests",
+]
+
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0388", reason = "derivative is a build-time proc macro inherited from CosmWasm 1.5; no maintained compatible replacement exists and it is not linked into contract Wasm" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

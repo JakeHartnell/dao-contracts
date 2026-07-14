@@ -80,6 +80,12 @@ cd packages/dao-hooks
 cargo publish
 cd "$START_DIR"
 
+# Gauge protocol must be available before any gauge contract tarball can
+# resolve its crates.io dependency during package verification.
+cd packages/gauge-interface
+cargo publish
+cd "$START_DIR"
+
 cd packages/cw-tokenfactory-types
 cargo publish
 cd "$START_DIR"
@@ -215,6 +221,21 @@ cargo hack publish --no-dev-deps --allow-dirty
 cd "$START_DIR"
 
 cd contracts/external/dao-migrator
+cargo hack publish --no-dev-deps --allow-dirty
+cd "$START_DIR"
+
+# Gauges are published as reusable crates as well as release Wasm artifacts.
+# gauge-interface was published above and has had several index propagation
+# waits by the time these dependent packages are reached.
+cd contracts/gauges/gauge
+cargo hack publish --no-dev-deps --allow-dirty
+cd "$START_DIR"
+
+cd contracts/gauges/gauge-adapter
+cargo hack publish --no-dev-deps --allow-dirty
+cd "$START_DIR"
+
+cd contracts/gauges/budget-allocator
 cargo hack publish --no-dev-deps --allow-dirty
 cd "$START_DIR"
 
