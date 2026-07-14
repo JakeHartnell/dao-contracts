@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     contract::{execute, instantiate, migrate, query},
-    msg::{AdapterQueryMsg, AssetUnchecked, ExecuteMsg, InstantiateMsg},
+    msg::{AssetUnchecked, ExecuteMsg, InstantiateMsg, QueryMsg},
 };
 
 pub fn adapter_contract() -> Box<dyn cw_multi_test::Contract<Empty>> {
@@ -202,7 +202,7 @@ impl Suite {
         }
     }
 
-    pub fn query<T: DeserializeOwned>(&self, msg: &AdapterQueryMsg) -> StdResult<T> {
+    pub fn query<T: DeserializeOwned>(&self, msg: &QueryMsg) -> StdResult<T> {
         self.app.wrap().query_wasm_smart(&self.adapter, msg)
     }
 

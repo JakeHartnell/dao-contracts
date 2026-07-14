@@ -1,9 +1,10 @@
 [package]
 name = "gauge-adapter"
+description = "Bonded marketing registry and payout adapter for DAO DAO gauges"
 authors = ["Jakub <jakub@confio.gmbh>"]
 version = { workspace = true }
 edition = { workspace = true }
-license = { workspace = true }
+license = "Apache-2.0"
 repository = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -26,6 +27,7 @@ cw20 = { workspace = true }
 cw-denom = { workspace = true }
 cw-ownable = { workspace = true }
 cw-utils = { workspace = true }
+gauge-interface = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
 

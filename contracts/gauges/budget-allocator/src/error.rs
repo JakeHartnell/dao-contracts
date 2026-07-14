@@ -1,5 +1,6 @@
 use cosmwasm_std::StdError;
 use cw_ownable::OwnershipError;
+use cw_utils::PaymentError;
 use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq)]
@@ -10,6 +11,9 @@ pub enum ContractError {
     #[error(transparent)]
     Ownership(#[from] OwnershipError),
 
+    #[error(transparent)]
+    Payment(#[from] PaymentError),
+
     #[error("Option {0} already exists")]
     OptionAlreadyExists(String),
 
@@ -18,4 +22,7 @@ pub enum ContractError {
 
     #[error("InstantiateMsg must include at least one option")]
     NoOptions {},
+
+    #[error("Too many options: {count}; maximum is {max}")]
+    TooManyOptions { count: usize, max: usize },
 }

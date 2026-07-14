@@ -1,7 +1,10 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{CosmosMsg, Decimal, Uint128};
+use cosmwasm_std::{Decimal, Uint128};
 use cw4::MemberChangedHookMsg;
 use dao_hooks::{nft_stake::NftStakeChangedHookMsg, stake::StakeChangedHookMsg};
+pub use gauge_interface::{
+    AdapterQueryMsg, AllOptionsResponse, CheckOptionResponse, SampleGaugeMsgsResponse,
+};
 
 use crate::state::{Reset, Vote};
 
@@ -62,10 +65,11 @@ pub enum ExecuteMsg {
         max_options_selected: Option<u32>,
         max_available_percentage: Option<Decimal>,
     },
-    /// Stops a given gauge, meaning it will not execute any more messages,
-    /// Or receive any more updates on MemberChangedHook.
-    /// Ideally, this will allow for eventual deletion of all data on that gauge
+    /// Freezes voting, reset, and epoch execution for a gauge. Voting-power
+    /// hooks continue updating existing votes so accounting remains current.
     StopGauge { gauge: u64 },
+    /// Owner-only: resumes voting, reset, and epoch execution for a stopped gauge.
+    ResumeGauge { gauge: u64 },
     /// Resets all votes on a given gauge if it is configured to be periodically reset and the epoch has passed.
     /// One call to this will only clear `batch_size` votes to prevent gas exhaustion. Call repeatedly to clear all votes.
     ResetGauge { gauge: u64, batch_size: u32 },
@@ -82,7 +86,8 @@ pub enum ExecuteMsg {
     PlaceVotes {
         /// Gauge to vote on
         gauge: u64,
-        /// The options to put my vote on, along with proper weights (must sum up to 1.0)
+        /// The options to put my vote on, along with positive weights whose sum
+        /// is at most 1.0. Any unused weight is intentionally unallocated.
         /// "None" means remove existing votes and abstain
         votes: Option<Vec<Vote>>,
     },
@@ -107,6 +112,8 @@ pub struct CreateGaugeReply {
 #[cw_serde]
 #[derive(QueryResponses)]
 pub enum QueryMsg {
+    #[returns(ConfigResponse)]
+    Config {},
     #[returns(dao_interface::voting::InfoResponse)]
     Info {},
     #[returns(GaugeResponse)]
@@ -134,9 +141,21 @@ pub enum QueryMsg {
     SelectedSet { gauge: u64 },
     #[returns(LastExecutedSetResponse)]
     LastExecutedSet { gauge: u64 },
+    /// Bounded reconciliation of the tally primary map, sorted index,
+    /// aggregate total, tombstones, and reset cursor for one gauge.
+    #[returns(GaugeHealthResponse)]
+    GaugeHealth { gauge: u64 },
     /// List the currently-registered `GaugeVoteHook` subscribers.
     #[returns(GetHooksResponse)]
     GetHooks {},
+}
+
+#[cw_serde]
+pub struct ConfigResponse {
+    pub owner: String,
+    pub dao_core: String,
+    pub voting_powers: String,
+    pub hook_caller: String,
 }
 
 #[cw_serde]
@@ -209,6 +228,24 @@ pub struct ListOptionsResponse {
     pub options: Vec<(String, Uint128)>,
 }
 
+#[cw_serde]
+pub struct GaugeHealthResponse {
+    pub gauge_id: u64,
+    pub option_count: u32,
+    pub active_option_count: u32,
+    pub invalid_option_count: u32,
+    pub indexed_option_count: u32,
+    pub tally_sum: Uint128,
+    pub total_cast: Uint128,
+    pub mismatch_count: u32,
+    pub first_mismatch: Option<String>,
+    pub reset_cursor: Option<String>,
+    /// False if legacy/corrupt state exceeded the enforced option bound and
+    /// the reconciliation deliberately stopped rather than silently truncating.
+    pub scan_complete: bool,
+    pub consistent: bool,
+}
+
 /// List the options that were selected in the last executed set.
 #[cw_serde]
 pub struct LastExecutedSetResponse {
@@ -223,40 +260,10 @@ pub struct SelectedSetResponse {
     pub votes: Vec<(String, Uint128)>,
 }
 
-/// Queries the gauge requires from the adapter contract in order to function
-#[cw_serde]
-#[derive(QueryResponses)]
-pub enum AdapterQueryMsg {
-    #[returns(AllOptionsResponse)]
-    AllOptions {},
-    #[returns(CheckOptionResponse)]
-    CheckOption { option: String },
-    #[returns(SampleGaugeMsgsResponse)]
-    SampleGaugeMsgs {
-        /// option along with weight
-        /// sum of all weights should be 1.0 (within rounding error)
-        selected: Vec<(String, Decimal)>,
-    },
-}
-
-#[cw_serde]
-pub struct AllOptionsResponse {
-    pub options: Vec<String>,
-}
-
-#[cw_serde]
-pub struct CheckOptionResponse {
-    pub valid: bool,
-}
-
-#[cw_serde]
-pub struct SampleGaugeMsgsResponse {
-    // NOTE: I think we will never need CustomMsg here, any reason we should include??
-    pub execute: Vec<CosmosMsg>,
-}
-
 #[cw_serde]
 pub struct MigrateMsg {
+    /// Optional per-gauge schedule updates. At most 100 unique gauge IDs.
+    /// The whole migration is rejected before writes if any update is invalid.
     pub gauge_config: Option<Vec<(GaugeId, GaugeMigrationConfig)>>,
 }
 
@@ -275,4 +282,36 @@ pub struct ResetMigrationConfig {
     pub reset_epoch: u64,
     /// When to start the first reset
     pub next_reset: u64,
+}
+
+#[cfg(test)]
+mod schema_smoke_tests {
+    use super::*;
+    use cosmwasm_std::from_json;
+
+    #[test]
+    fn representative_external_payloads_deserialize() {
+        let _: InstantiateMsg = from_json(
+            br#"{"voting_powers":"voting","hook_caller":"hooks","owner":"owner","gauges":null}"#,
+        )
+        .unwrap();
+        let vote: ExecuteMsg = from_json(
+            br#"{"place_votes":{"gauge":7,"votes":[{"option":"alpha","weight":"0.5"}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(vote, ExecuteMsg::PlaceVotes { gauge: 7, .. }));
+        let _: QueryMsg =
+            from_json(br#"{"list_options":{"gauge":7,"start_after":"alpha","limit":25}}"#).unwrap();
+        let _: QueryMsg = from_json(br#"{"gauge_health":{"gauge":7}}"#).unwrap();
+        let _: GaugeHealthResponse = from_json(
+            br#"{"gauge_id":7,"option_count":1,"active_option_count":1,"invalid_option_count":0,"indexed_option_count":1,"tally_sum":"42","total_cast":"42","mismatch_count":0,"first_mismatch":null,"reset_cursor":null,"scan_complete":true,"consistent":true}"#,
+        )
+        .unwrap();
+        let _: SelectedSetResponse = from_json(br#"{"votes":[["alpha","42"]]}"#).unwrap();
+        let _: CreateGaugeReply = from_json(br#"{"id":7}"#).unwrap();
+        let _: MigrateMsg = from_json(
+            br#"{"gauge_config":[[7,{"next_epoch":1234,"reset":{"reset_epoch":600,"next_reset":1800}}]]}"#,
+        )
+        .unwrap();
+    }
 }

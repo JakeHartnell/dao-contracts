@@ -8,7 +8,8 @@ The gauge orchestrates the voting, the adapter translates the result into
 
 Inspired by the [Curve gauge system](https://resources.curve.fi/reward-gauges/gauge-weights).
 Forked from the [Wynd DAO repo](https://github.com/wynddao/wynddao) (Apache-2.0;
-git history preserved per the LICENSE/NOTICE files) and modified to support any
+the upstream license and attribution are preserved in [LICENSE](./LICENSE) and
+[NOTICE](./NOTICE)) and modified to support any
 DAO DAO voting module — cw4 membership, cw20-staked, cw721-staked, native- or
 token-factory-staked.
 
@@ -53,6 +54,16 @@ DAO DAO core, with the staking module's hooks routed to it.
 
 See the individual contract READMEs for ExecuteMsg / QueryMsg semantics and
 integration walk-throughs.
+
+Production reviewers and operators should also read the
+[architecture and threat model](./ARCHITECTURE.md) and the
+[operations and recovery runbook](./OPERATIONS.md). Indexer fields are defined
+in the [event contract](./EVENTS.md), and artifact and crates.io identity rules
+are defined in the [release policy](./RELEASE.md). Production monitoring must
+implement the [alert contract](./MONITORING.md) and retain its required canary
+evidence. The current distinction between locally verified work, remaining
+engineering checks, and genuinely external gates is maintained in the
+[readiness evidence](./READINESS.md).
 
 ## Reference deployments
 

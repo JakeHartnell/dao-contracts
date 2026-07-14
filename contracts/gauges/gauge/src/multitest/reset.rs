@@ -83,8 +83,42 @@ fn basic_gauge_reset() {
             .unwrap()
     );
 
+    assert_eq!(
+        ContractError::InvalidResetBatchSize { size: 0, max: 100 },
+        suite
+            .reset_gauge("anyone", &gauge_contract, gauge_id, 0)
+            .unwrap_err()
+            .downcast()
+            .unwrap()
+    );
+    assert_eq!(
+        ContractError::InvalidResetBatchSize {
+            size: 101,
+            max: 100
+        },
+        suite
+            .reset_gauge("anyone", &gauge_contract, gauge_id, 101)
+            .unwrap_err()
+            .downcast()
+            .unwrap()
+    );
+
     // reset
     suite.advance_time(RESET_EPOCH);
+    suite
+        .stop_gauge(&gauge_contract, suite.owner.clone(), gauge_id)
+        .unwrap();
+    assert_eq!(
+        ContractError::GaugeStopped(gauge_id),
+        suite
+            .reset_gauge("someone", &gauge_contract, gauge_id, 100)
+            .unwrap_err()
+            .downcast()
+            .unwrap()
+    );
+    suite
+        .resume_gauge(&gauge_contract, suite.owner.clone(), gauge_id)
+        .unwrap();
     suite
         .reset_gauge("someone", &gauge_contract, gauge_id, 100) // 100 is way more than needed
         .unwrap();
@@ -388,6 +422,15 @@ fn partial_reset() {
         )
         .unwrap();
 
+    // Reset is the bounded garbage-collection path for removal tombstones and
+    // their still-referencing vote records.
+    suite
+        .remove_option(&gauge_contract, "owner", gauge_id, voter1)
+        .unwrap();
+    let before_reset = suite.query_gauge_health(&gauge_contract, gauge_id).unwrap();
+    assert_eq!(before_reset.invalid_option_count, 1);
+    assert!(before_reset.consistent);
+
     // start resetting
     suite.advance_time(RESET_EPOCH);
     suite
@@ -414,4 +457,20 @@ fn partial_reset() {
     suite
         .reset_gauge("someone", &gauge_contract, gauge_id, 1)
         .unwrap();
+
+    // Exactly one remaining option is completed by the second size-1 batch;
+    // the stable cursor must not revisit the first zeroed option.
+    let options = suite.query_list_options(&gauge_contract, gauge_id).unwrap();
+    assert_eq!(options, vec![(voter2.to_owned(), Uint128::zero())]);
+    let after_reset = suite.query_gauge_health(&gauge_contract, gauge_id).unwrap();
+    assert_eq!(after_reset.invalid_option_count, 0);
+    assert_eq!(after_reset.option_count, 1);
+    assert!(after_reset.consistent);
+    suite
+        .place_vote(&gauge_contract, voter1, gauge_id, Some(voter2.to_owned()))
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge_contract, gauge_id).unwrap(),
+        vec![(voter2.to_owned(), Uint128::new(100))]
+    );
 }

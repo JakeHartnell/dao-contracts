@@ -66,3 +66,12 @@ module, so the DAO must hold enough of `epoch_budget.denom` for the
 selected set to actually transfer. If the DAO is underfunded the dispatch
 will fail at execution time; consider integrating with a treasury balance
 check or topping the DAO up regularly.
+
+## Migration compatibility
+
+The workspace package, Wasm artifact, and cw2 identity use
+`gauge-budget-allocator` (cw2 stores `crates.io:gauge-budget-allocator`). This
+contract first appears at the current workspace version and has no historical
+artifact or state layout to migrate, so the first release intentionally exports
+no `migrate` entry point. A future release must add an explicit source-version
+matrix and populated-state migration before enabling that surface.

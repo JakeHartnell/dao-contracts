@@ -1,4 +1,5 @@
 use cosmwasm_std::{Addr, Decimal, Uint128};
+use cw_multi_test::AppResponse;
 use dao_voting::voting::Vote;
 
 use super::suite::{Suite, SuiteBuilder};
@@ -7,6 +8,166 @@ use crate::error::ContractError;
 use crate::msg::{GaugeMigrationConfig, GaugeResponse};
 
 const EPOCH: u64 = 7 * 86_400;
+
+fn assert_mutation_event(response: &AppResponse, expected: &[(&str, &str)]) {
+    assert!(
+        response.events.iter().any(|event| {
+            expected.iter().all(|(key, value)| {
+                event
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key == *key && attribute.value == *value)
+            })
+        }),
+        "missing event attributes {expected:?} in {:?}",
+        response.events
+    );
+}
+
+#[test]
+fn mutation_events_expose_stable_indexer_fields() {
+    let voter = "voter";
+    let owner = "owner";
+    let keeper = "keeper";
+    let mut suite = SuiteBuilder::new()
+        .with_voting_members(&[(voter, 100)])
+        .with_core_balance((1_000, "ujuno"))
+        .build();
+    let gauge = init_gauge(&mut suite, &[voter]);
+
+    let (adapter, created) = suite
+        .instantiate_adapter_and_create_gauge_with_response(
+            gauge.clone(),
+            &[voter],
+            (1_000, "ujuno"),
+            None,
+            Some(100),
+        )
+        .unwrap();
+    assert_mutation_event(
+        &created,
+        &[
+            ("action", "create_gauge"),
+            ("sender", owner),
+            ("gauge_id", "0"),
+        ],
+    );
+
+    suite.add_valid_option(&adapter, "temporary").unwrap();
+    let added = suite.add_option(&gauge, voter, 0, "temporary").unwrap();
+    assert_mutation_event(
+        &added,
+        &[
+            ("action", "add_option"),
+            ("sender", voter),
+            ("gauge_id", "0"),
+            ("option", "temporary"),
+        ],
+    );
+    suite.invalidate_option(&adapter, "temporary").unwrap();
+    let removed = suite.remove_option(&gauge, owner, 0, "temporary").unwrap();
+    assert_mutation_event(
+        &removed,
+        &[
+            ("action", "remove_option"),
+            ("sender", owner),
+            ("gauge_id", "0"),
+            ("option", "temporary"),
+        ],
+    );
+
+    let updated = suite
+        .update_gauge(
+            owner,
+            gauge.clone(),
+            0,
+            Some(EPOCH + 1),
+            Some(Decimal::percent(10)),
+            Some(5),
+            Some(Decimal::percent(50)),
+        )
+        .unwrap();
+    assert_mutation_event(
+        &updated,
+        &[
+            ("action", "update_gauge"),
+            ("sender", owner),
+            ("gauge_id", "0"),
+            ("epoch_size", "604801"),
+            ("max_options_selected", "5"),
+        ],
+    );
+
+    let stopped = suite.stop_gauge(&gauge, owner, 0).unwrap();
+    assert_mutation_event(
+        &stopped,
+        &[
+            ("action", "stop_gauge"),
+            ("sender", owner),
+            ("gauge_id", "0"),
+        ],
+    );
+    let resumed = suite.resume_gauge(&gauge, owner, 0).unwrap();
+    assert_mutation_event(
+        &resumed,
+        &[
+            ("action", "resume_gauge"),
+            ("sender", owner),
+            ("gauge_id", "0"),
+        ],
+    );
+
+    let voted = suite
+        .place_votes(
+            &gauge,
+            voter,
+            0,
+            Some(vec![(voter.to_owned(), Decimal::one())]),
+        )
+        .unwrap();
+    assert_mutation_event(
+        &voted,
+        &[
+            ("action", "place_vote"),
+            ("sender", voter),
+            ("gauge_id", "0"),
+            ("option_count", "1"),
+            ("voting_power", "100"),
+        ],
+    );
+
+    suite.advance_time(EPOCH + 1);
+    let reset = suite.reset_gauge(keeper, &gauge, 0, 100).unwrap();
+    assert_mutation_event(
+        &reset,
+        &[
+            ("action", "reset_gauge"),
+            ("sender", keeper),
+            ("gauge_id", "0"),
+            ("processed", "1"),
+            ("complete", "true"),
+        ],
+    );
+    suite
+        .place_votes(
+            &gauge,
+            voter,
+            0,
+            Some(vec![(voter.to_owned(), Decimal::one())]),
+        )
+        .unwrap();
+    let executed = suite.execute_options(&gauge, keeper, 0).unwrap();
+    assert_mutation_event(
+        &executed,
+        &[
+            ("action", "execute_tally"),
+            ("sender", keeper),
+            ("gauge_id", "0"),
+            ("selected_count", "1"),
+            ("message_count", "1"),
+        ],
+    );
+}
 
 #[test]
 fn create_gauge() {
@@ -47,7 +208,7 @@ fn create_gauge() {
 }
 
 #[test]
-fn gauge_can_upgrade_from_self() {
+fn gauge_can_upgrade_from_older_version() {
     let voter1 = "voter1";
     let mut suite = SuiteBuilder::new()
         .with_voting_members(&[(voter1, 100)])
@@ -65,7 +226,8 @@ fn gauge_can_upgrade_from_self() {
         )
         .unwrap();
 
-    // now let's migrate the gauge and make sure nothing breaks
+    // The suite instantiates the gauge with an older cw2 version and migrates
+    // it to a distinct current code ID.
     suite.auto_migrate_gauge(&gauge_contract, None).unwrap();
 
     let response = suite.query_gauge(gauge_contract, 0).unwrap();
@@ -243,6 +405,141 @@ fn execute_gauge() {
         suite.query_balance(voter1, reward_to_distribute.1).unwrap(),
         1000u128
     );
+}
+
+#[test]
+fn allocation_selection_matrix() {
+    let voter1 = "voter1";
+    let voter2 = "voter2";
+    let mut suite = SuiteBuilder::new()
+        .with_voting_members(&[(voter1, 100), (voter2, 100)])
+        .build();
+    let gauge_contract = init_gauge(&mut suite, &[voter1, voter2]);
+
+    // Each row is a separate gauge so its threshold/cap can be evaluated
+    // independently while using the same real orchestrator and adapter stack.
+    let mut adapters = Vec::new();
+    for cap in [
+        None,
+        Some(Decimal::percent(60)),
+        Some(Decimal::percent(40)),
+        None,
+        Some(Decimal::permille(1)),
+    ] {
+        adapters.push(
+            suite
+                .instantiate_adapter_and_create_gauge(
+                    gauge_contract.clone(),
+                    &[voter1, voter2],
+                    (1_000, "ujuno"),
+                    cap,
+                    None,
+                )
+                .unwrap(),
+        );
+    }
+
+    // No votes means no selected options and therefore a no-op execution path.
+    assert!(suite
+        .query_selected_set(&gauge_contract, 0)
+        .unwrap()
+        .is_empty());
+
+    // Partial turnout: allocation is relative to cast power. A sole voter is a
+    // single 100-power winner even though another 100-power member abstained.
+    suite
+        .place_vote(&gauge_contract, voter1, 0, Some(voter1.to_owned()))
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge_contract, 0).unwrap(),
+        vec![(voter1.to_owned(), Uint128::new(100))]
+    );
+
+    // A valid non-empty selection may intentionally produce no adapter
+    // messages. Execution still records the set and advances the epoch.
+    suite.set_adapter_return_empty(&adapters[0], true).unwrap();
+    suite.advance_time(EPOCH);
+    let response = suite.execute_options(&gauge_contract, voter1, 0).unwrap();
+    assert_mutation_event(
+        &response,
+        &[
+            ("action", "execute_tally"),
+            ("selected_count", "1"),
+            ("message_count", "0"),
+        ],
+    );
+    assert_eq!(
+        suite.query_last_executed_set(&gauge_contract, 0).unwrap(),
+        Some(vec![(voter1.to_owned(), Uint128::new(100))])
+    );
+
+    // A 60% cap is above each actual 50% share and changes nothing.
+    for voter in [voter1, voter2] {
+        suite
+            .place_vote(&gauge_contract, voter, 1, Some(voter.to_owned()))
+            .unwrap();
+    }
+    assert_eq!(
+        suite.query_selected_set(&gauge_contract, 1).unwrap(),
+        vec![
+            (voter2.to_owned(), Uint128::new(100)),
+            (voter1.to_owned(), Uint128::new(100)),
+        ]
+    );
+
+    // A 40% cap is below each actual 50% share. Excess is burned: both powers
+    // become 80 (40% of 200 cast), rather than being renormalized to 100 each.
+    for voter in [voter1, voter2] {
+        suite
+            .place_vote(&gauge_contract, voter, 2, Some(voter.to_owned()))
+            .unwrap();
+    }
+    assert_eq!(
+        suite.query_selected_set(&gauge_contract, 2).unwrap(),
+        vec![
+            (voter2.to_owned(), Uint128::new(80)),
+            (voter1.to_owned(), Uint128::new(80)),
+        ]
+    );
+
+    // Raise the default 5% threshold to 6%. The exact 5% option is excluded,
+    // while the 95% option remains selected.
+    suite
+        .update_gauge(
+            "owner",
+            gauge_contract.clone(),
+            3,
+            None,
+            Some(Decimal::percent(6)),
+            None,
+            None,
+        )
+        .unwrap();
+    suite
+        .place_votes(
+            &gauge_contract,
+            voter1,
+            3,
+            vec![
+                (voter1.to_owned(), Decimal::percent(95)),
+                (voter2.to_owned(), Decimal::percent(5)),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge_contract, 3).unwrap(),
+        vec![(voter1.to_owned(), Uint128::new(95))]
+    );
+
+    // A tiny cap that floors to zero removes the candidate, making execution
+    // a documented no-op instead of constructing a zero denominator/amount.
+    suite
+        .place_vote(&gauge_contract, voter1, 4, Some(voter1.to_owned()))
+        .unwrap();
+    assert!(suite
+        .query_selected_set(&gauge_contract, 4)
+        .unwrap()
+        .is_empty());
 }
 
 /// Small helper method to setup the gauge contract.
@@ -527,27 +824,19 @@ fn execute_stopped_gauge() {
         .stop_gauge(&gauge_contract, suite.owner.clone(), gauge_id)
         .unwrap();
 
-    // vote for one of the options in gauge
-    suite
+    // voting is frozen while stopped
+    let err = suite
         .place_vote(
             &gauge_contract,
             voter1.to_owned(),
             gauge_id,
             Some(voter1.to_owned()), // option to vote for
         )
-        .unwrap();
-    suite
-        .place_vote(
-            &gauge_contract,
-            voter2.to_owned(),
-            gauge_id,
-            Some(voter1.to_owned()),
-        )
-        .unwrap();
-
-    // Despite gauge being stopped, user
-    let selected_set = suite.query_selected_set(&gauge_contract, gauge_id).unwrap();
-    assert_eq!(selected_set, vec![("voter1".to_owned(), Uint128::new(200))]);
+        .unwrap_err();
+    assert_eq!(
+        ContractError::GaugeStopped(gauge_id),
+        err.downcast().unwrap()
+    );
 
     // before advancing specified epoch tally won't get sampled
     suite.advance_time(EPOCH);
@@ -558,6 +847,36 @@ fn execute_stopped_gauge() {
     assert_eq!(
         ContractError::GaugeStopped(gauge_id),
         err.downcast().unwrap()
+    );
+
+    // only the owner can resume
+    let err = suite
+        .resume_gauge(&gauge_contract, voter1, gauge_id)
+        .unwrap_err();
+    assert_eq!(ContractError::Unauthorized {}, err.downcast().unwrap());
+
+    suite
+        .resume_gauge(&gauge_contract, suite.owner.clone(), gauge_id)
+        .unwrap();
+    suite
+        .place_vote(
+            &gauge_contract,
+            voter1.to_owned(),
+            gauge_id,
+            Some(voter1.to_owned()),
+        )
+        .unwrap();
+    let selected_set = suite.query_selected_set(&gauge_contract, gauge_id).unwrap();
+    assert_eq!(selected_set, vec![("voter1".to_owned(), Uint128::new(100))]);
+
+    // Resuming does not impose a turnout threshold: one voter may execute the
+    // full epoch allocation even though another voter has not participated.
+    suite
+        .execute_options(&gauge_contract, voter1, gauge_id)
+        .unwrap();
+    assert_eq!(
+        suite.query_balance(voter1, reward_to_distribute.1).unwrap(),
+        reward_to_distribute.0
     );
 }
 

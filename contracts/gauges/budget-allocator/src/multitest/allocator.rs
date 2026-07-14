@@ -1,4 +1,5 @@
 use cosmwasm_std::{coin, BankMsg, CosmosMsg, Decimal};
+use cw_multi_test::AppResponse;
 
 use crate::{
     msg::{AllOptionsResponse, CheckOptionResponse, ExecuteMsg, QueryMsg, SampleGaugeMsgsResponse},
@@ -6,6 +7,21 @@ use crate::{
     state::Config,
     ContractError,
 };
+
+fn assert_mutation_event(response: &AppResponse, expected: &[(&str, &str)]) {
+    assert!(
+        response.events.iter().any(|event| {
+            expected.iter().all(|(key, value)| {
+                event
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key == *key && attribute.value == *value)
+            })
+        }),
+        "missing event attributes {expected:?} in {:?}",
+        response.events
+    );
+}
 
 #[test]
 fn instantiate_requires_at_least_one_option() {
@@ -36,7 +52,12 @@ fn instantiate_requires_at_least_one_option() {
 fn happy_path_options_and_budget() {
     let suite = Suite::new(&["alice", "bob"], ujuno(1_000));
 
-    let opts: AllOptionsResponse = suite.query(&QueryMsg::AllOptions {}).unwrap();
+    let opts: AllOptionsResponse = suite
+        .query(&QueryMsg::AllOptions {
+            start_after: None,
+            limit: None,
+        })
+        .unwrap();
     assert_eq!(opts.options.len(), 2);
     assert!(opts.options.contains(&"alice".to_string()));
 
@@ -62,20 +83,46 @@ fn happy_path_options_and_budget() {
 fn owner_can_add_and_remove_options() {
     let mut suite = Suite::new(&["alice"], ujuno(1_000));
 
-    suite
+    let added = suite
         .execute_owner(&ExecuteMsg::AddOption {
             option: "bob".to_string(),
         })
         .unwrap();
-    let opts: AllOptionsResponse = suite.query(&QueryMsg::AllOptions {}).unwrap();
+    assert_mutation_event(
+        &added,
+        &[
+            ("action", "add_option"),
+            ("sender", "owner"),
+            ("option", "bob"),
+        ],
+    );
+    let opts: AllOptionsResponse = suite
+        .query(&QueryMsg::AllOptions {
+            start_after: None,
+            limit: None,
+        })
+        .unwrap();
     assert_eq!(opts.options.len(), 2);
 
-    suite
+    let removed = suite
         .execute_owner(&ExecuteMsg::RemoveOption {
             option: "alice".to_string(),
         })
         .unwrap();
-    let opts: AllOptionsResponse = suite.query(&QueryMsg::AllOptions {}).unwrap();
+    assert_mutation_event(
+        &removed,
+        &[
+            ("action", "remove_option"),
+            ("sender", "owner"),
+            ("option", "alice"),
+        ],
+    );
+    let opts: AllOptionsResponse = suite
+        .query(&QueryMsg::AllOptions {
+            start_after: None,
+            limit: None,
+        })
+        .unwrap();
     assert_eq!(opts.options, vec!["bob"]);
 }
 
@@ -142,11 +189,20 @@ fn non_owner_cannot_mutate() {
 #[test]
 fn update_budget_works() {
     let mut suite = Suite::new(&["alice"], ujuno(1_000));
-    suite
+    let updated = suite
         .execute_owner(&ExecuteMsg::UpdateBudget {
             epoch_budget: ujuno(2_500),
         })
         .unwrap();
+    assert_mutation_event(
+        &updated,
+        &[
+            ("action", "update_budget"),
+            ("sender", "owner"),
+            ("denom", "ujuno"),
+            ("amount", "2500"),
+        ],
+    );
     let cfg: Config = suite.query(&QueryMsg::Config {}).unwrap();
     assert_eq!(cfg.epoch_budget, ujuno(2_500));
 }

@@ -1,8 +1,14 @@
 use cosmwasm_schema::cw_serde;
-use cosmwasm_std::{to_json_binary, Addr, StdResult, Storage, SubMsg, Uint128, WasmMsg};
+use cosmwasm_std::{to_json_binary, Addr, DepsMut, SubMsg, Uint128, WasmMsg};
 use cw_hooks::Hooks;
 
+use crate::error::ContractError;
 use crate::state::Vote;
+use crate::state::{NEXT_VOTE_HOOK_REPLY_ID, VOTE_HOOK_REPLIES};
+
+/// Keep vote-hook replies in their own half of the u64 namespace so future
+/// reply-driven features can reserve the lower half.
+const FIRST_VOTE_HOOK_REPLY_ID: u64 = 1 << 63;
 
 /// Hook fired from the orchestrator on `PlaceVotes`. Subscribers can use it
 /// to drive participation rewards, off-chain notifications, analytics, etc.
@@ -29,18 +35,17 @@ pub enum GaugeVoteHookExecuteMsg {
 }
 
 /// Build the `SubMsg` list for every currently-registered hook. Each submsg
-/// uses `reply_on_error` with the hook's index as its reply ID, so the
-/// `reply` entry-point can auto-unregister failing subscribers without
-/// blocking the underlying `PlaceVotes` call.
+/// uses a stable, namespaced reply ID associated with the hook address. Both
+/// successful and failed calls reply so the temporary association is cleaned.
 pub fn new_vote_hook_msgs(
     hooks: Hooks,
-    storage: &dyn Storage,
+    deps: DepsMut,
     gauge_id: u64,
     voter: Addr,
     votes: Vec<Vote>,
     voting_power: Uint128,
     height: u64,
-) -> StdResult<Vec<SubMsg>> {
+) -> Result<Vec<SubMsg>, ContractError> {
     let msg = to_json_binary(&GaugeVoteHookExecuteMsg::GaugeVoteHook(
         GaugeVoteHookMsg::NewVotes {
             gauge_id,
@@ -50,15 +55,25 @@ pub fn new_vote_hook_msgs(
             height,
         },
     ))?;
-    let mut idx: u64 = 0;
-    hooks.prepare_hooks(storage, |a| {
+    let addresses = hooks.query_hooks(deps.as_ref())?.hooks;
+    let mut next = NEXT_VOTE_HOOK_REPLY_ID
+        .may_load(deps.storage)?
+        .unwrap_or(FIRST_VOTE_HOOK_REPLY_ID);
+    let mut messages = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let address = deps.api.addr_validate(&address)?;
+        let id = next;
+        next = next
+            .checked_add(1)
+            .ok_or(ContractError::VoteHookReplyIdExhausted {})?;
+        VOTE_HOOK_REPLIES.save(deps.storage, id, &address)?;
         let execute = WasmMsg::Execute {
-            contract_addr: a.to_string(),
+            contract_addr: address.to_string(),
             msg: msg.clone(),
             funds: vec![],
         };
-        let sub = SubMsg::reply_on_error(execute, idx);
-        idx += 1;
-        Ok(sub)
-    })
+        messages.push(SubMsg::reply_always(execute, id));
+    }
+    NEXT_VOTE_HOOK_REPLY_ID.save(deps.storage, &next)?;
+    Ok(messages)
 }

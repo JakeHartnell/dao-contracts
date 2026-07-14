@@ -1,7 +1,10 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, CosmosMsg, Decimal, Uint128};
+use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw20::Cw20ReceiveMsg;
 use cw_denom::UncheckedDenom;
+pub use gauge_interface::{
+    AdapterQueryMsg, AllOptionsResponse, CheckOptionResponse, SampleGaugeMsgsResponse,
+};
 
 #[cw_serde]
 pub struct InstantiateMsg {
@@ -29,7 +32,8 @@ pub enum ExecuteMsg {
         url: String,
         address: String,
     },
-    /// Sends back all deposit to senders.
+    /// Refunds active bonds in bounded batches of at most 50 submissions.
+    /// Call repeatedly until the response reports `complete=true`.
     ReturnDeposits {},
     /// Owner-only: remove a submission from the registry. If a deposit was
     /// required, `soft = true` refunds it to the original sender (good-
@@ -55,18 +59,21 @@ pub enum ReceiveMsg {
 }
 
 #[cw_serde]
-pub enum MigrateMsg {}
+pub struct MigrateMsg {}
 
 // Queries copied from gauge-orchestrator for now (we could use a common crate for this).
 /// Queries the gauge requires from the adapter contract in order to function.
 #[cw_ownable::cw_ownable_query]
 #[cw_serde]
 #[derive(QueryResponses)]
-pub enum AdapterQueryMsg {
+pub enum QueryMsg {
     #[returns(crate::state::Config)]
     Config {},
     #[returns(AllOptionsResponse)]
-    AllOptions {},
+    AllOptions {
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
     #[returns(CheckOptionResponse)]
     CheckOption { option: String },
     #[returns(SampleGaugeMsgsResponse)]
@@ -80,26 +87,20 @@ pub enum AdapterQueryMsg {
     #[returns(SubmissionResponse)]
     Submission { address: String },
     #[returns(AllSubmissionsResponse)]
-    AllSubmissions {},
+    AllSubmissions {
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
     /// Return all submissions made by `sender`. Useful for "my submissions"
     /// views in registration flows.
     #[returns(AllSubmissionsResponse)]
-    SubmissionsBySender { sender: String },
-}
-
-#[cw_serde]
-pub struct AllOptionsResponse {
-    pub options: Vec<String>,
-}
-
-#[cw_serde]
-pub struct CheckOptionResponse {
-    pub valid: bool,
-}
-
-#[cw_serde]
-pub struct SampleGaugeMsgsResponse {
-    pub execute: Vec<CosmosMsg>,
+    SubmissionsBySender {
+        sender: String,
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
+    #[returns(LiabilitiesResponse)]
+    Liabilities {},
 }
 
 #[cw_serde]
@@ -116,7 +117,55 @@ pub struct AllSubmissionsResponse {
 }
 
 #[cw_serde]
+pub struct LiabilitiesResponse {
+    pub asset: Option<crate::state::Asset>,
+    pub escrow_balance: Uint128,
+    pub refund_cursor: Option<Addr>,
+    pub refunds_complete: bool,
+}
+
+#[cw_serde]
 pub struct AssetUnchecked {
     pub denom: UncheckedDenom,
     pub amount: Uint128,
+}
+
+#[cfg(test)]
+mod schema_smoke_tests {
+    use super::*;
+    use cosmwasm_std::{from_json, to_json_binary};
+
+    #[test]
+    fn representative_external_payloads_deserialize() {
+        let _: InstantiateMsg = from_json(
+            br#"{"owner":"owner","required_deposit":{"denom":{"native":"ujuno"},"amount":"1000"},"community_pool":"community","reward":{"denom":{"native":"ujuno"},"amount":"5000"}}"#,
+        )
+        .unwrap();
+        let _: ExecuteMsg = from_json(
+            br#"{"create_submission":{"name":"DAO","url":"https://dao.example","address":"recipient"}}"#,
+        )
+        .unwrap();
+        let _: QueryMsg = from_json(br#"{"liabilities":{}}"#).unwrap();
+        let _: LiabilitiesResponse = from_json(
+            br#"{"asset":null,"escrow_balance":"0","refund_cursor":null,"refunds_complete":false}"#,
+        )
+        .unwrap();
+        let _: MigrateMsg = from_json(br#"{}"#).unwrap();
+
+        for protocol in [
+            AdapterQueryMsg::AllOptions {
+                start_after: None,
+                limit: Some(25),
+            },
+            AdapterQueryMsg::CheckOption {
+                option: "recipient".to_owned(),
+            },
+            AdapterQueryMsg::SampleGaugeMsgs {
+                selected: vec![("recipient".to_owned(), Decimal::percent(50))],
+            },
+        ] {
+            let encoded = to_json_binary(&protocol).unwrap();
+            let _: QueryMsg = from_json(encoded).unwrap();
+        }
+    }
 }

@@ -25,10 +25,12 @@ pub struct InstantiateMsg {
 pub enum ExecuteMsg {
     InvalidateOption { option: String },
     AddValidOption { option: String },
+    SetReturnEmpty { enabled: bool },
 }
 
 const OPTIONS: Map<String, bool> = Map::new("options");
 const TO_DISTRIBUTE: Item<Coin> = Item::new("to_spend");
+const RETURN_EMPTY: Item<bool> = Item::new("return_empty");
 
 fn instantiate(
     deps: DepsMut,
@@ -40,6 +42,7 @@ fn instantiate(
         .into_iter()
         .try_for_each(|option| OPTIONS.save(deps.storage, option, &true))?;
     TO_DISTRIBUTE.save(deps.storage, &msg.to_distribute)?;
+    RETURN_EMPTY.save(deps.storage, &false)?;
     Ok(Response::default())
 }
 
@@ -56,13 +59,16 @@ fn execute(
         ExecuteMsg::AddValidOption { option } => {
             OPTIONS.save(deps.storage, option, &true)?;
         }
+        ExecuteMsg::SetReturnEmpty { enabled } => {
+            RETURN_EMPTY.save(deps.storage, &enabled)?;
+        }
     }
     Ok(Response::new())
 }
 
 fn query(deps: Deps, _env: Env, msg: AdapterQueryMsg) -> Result<Binary, StdError> {
     match msg {
-        AdapterQueryMsg::AllOptions {} => to_json_binary(&AllOptionsResponse {
+        AdapterQueryMsg::AllOptions { .. } => to_json_binary(&AllOptionsResponse {
             options: OPTIONS
                 .keys(deps.storage, None, None, Order::Ascending)
                 .collect::<StdResult<Vec<_>>>()?,
@@ -71,6 +77,9 @@ fn query(deps: Deps, _env: Env, msg: AdapterQueryMsg) -> Result<Binary, StdError
             valid: OPTIONS.has(deps.storage, option),
         }),
         AdapterQueryMsg::SampleGaugeMsgs { selected } => {
+            if RETURN_EMPTY.load(deps.storage)? {
+                return to_json_binary(&SampleGaugeMsgsResponse { execute: vec![] });
+            }
             let to_distribute = TO_DISTRIBUTE.load(deps.storage)?;
             let mut weights_sum = Decimal::zero();
             let execute = selected

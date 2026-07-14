@@ -114,6 +114,18 @@ fn create_gauge_rejects_max_available_percent_at_one() {
     );
 }
 
+#[test]
+fn create_gauge_rejects_zero_reset_interval() {
+    let (mut suite, gauge_contract) = dao_with_gauge();
+    let mut config = base_config(&mut suite);
+    config.reset_epoch = Some(0);
+    let err = create_with(&mut suite, &gauge_contract, config);
+    assert_eq!(
+        ContractError::InvalidResetInterval {},
+        err.downcast().unwrap()
+    );
+}
+
 // --------------------------------------------------------- nonexistent gauge
 
 #[test]
@@ -173,6 +185,156 @@ fn place_votes_rejects_weight_sum_over_one() {
         ContractError::TooMuchVotingWeight(bad_sum),
         err.downcast().unwrap()
     );
+
+    // Incremental checked validation must reject an adversarial Decimal at
+    // the first entry instead of overflowing an unchecked vector sum.
+    let err = suite
+        .place_votes(
+            &gauge_contract,
+            VOTER1.to_owned(),
+            0,
+            Some(vec![
+                (VOTER1.to_owned(), Decimal::MAX),
+                (VOTER2.to_owned(), Decimal::MAX),
+            ]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        ContractError::TooMuchVotingWeight(Decimal::MAX),
+        err.downcast().unwrap()
+    );
+}
+
+#[test]
+fn place_votes_rejects_malformed_entries_before_accounting() {
+    let (mut suite, gauge_contract) = dao_with_gauge();
+    suite
+        .instantiate_adapter_and_create_gauge(
+            gauge_contract.clone(),
+            &[VOTER1, VOTER2],
+            (1000, "ujuno"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    for duplicate in [
+        vec![VOTER1, VOTER1, VOTER2],
+        vec![VOTER1, VOTER2, VOTER1],
+        vec![VOTER2, VOTER1, VOTER1],
+    ] {
+        let votes = duplicate
+            .into_iter()
+            .map(|option| (option.to_owned(), Decimal::percent(25)))
+            .collect::<Vec<_>>();
+        let err = suite
+            .place_votes(&gauge_contract, VOTER1.to_owned(), 0, Some(votes))
+            .unwrap_err();
+        assert_eq!(
+            ContractError::DuplicateVoteOption {
+                option: VOTER1.to_owned()
+            },
+            err.downcast().unwrap()
+        );
+    }
+
+    let err = suite
+        .place_votes(
+            &gauge_contract,
+            VOTER1.to_owned(),
+            0,
+            Some(vec![(VOTER1.to_owned(), Decimal::zero())]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        ContractError::ZeroVoteWeight {
+            option: VOTER1.to_owned()
+        },
+        err.downcast().unwrap()
+    );
+
+    let err = suite
+        .place_votes(
+            &gauge_contract,
+            VOTER1.to_owned(),
+            0,
+            Some(vec![(String::new(), Decimal::one())]),
+        )
+        .unwrap_err();
+    assert_eq!(ContractError::EmptyVoteOption {}, err.downcast().unwrap());
+
+    let too_many = (0..101)
+        .map(|i| (format!("option-{i}"), Decimal::percent(1)))
+        .collect::<Vec<_>>();
+    let err = suite
+        .place_votes(&gauge_contract, VOTER1.to_owned(), 0, Some(too_many))
+        .unwrap_err();
+    assert_eq!(
+        ContractError::TooManyVoteEntries {
+            count: 101,
+            max: 100
+        },
+        err.downcast().unwrap()
+    );
+
+    // The exact entry bound is accepted by structural validation. The first
+    // adapter-invalid option is the later error, proving this is not an
+    // off-by-one rejection at 100.
+    let at_limit = (0..100)
+        .map(|i| (format!("limit-option-{i}"), Decimal::percent(1)))
+        .collect::<Vec<_>>();
+    let err = suite
+        .place_votes(&gauge_contract, VOTER1.to_owned(), 0, Some(at_limit))
+        .unwrap_err();
+    assert_eq!(
+        ContractError::OptionDoesNotExists {
+            option: "limit-option-0".to_owned(),
+            gauge_id: 0,
+        },
+        err.downcast().unwrap()
+    );
+
+    let exact_length = "x".repeat(128);
+    let err = suite
+        .place_votes(
+            &gauge_contract,
+            VOTER1.to_owned(),
+            0,
+            Some(vec![(exact_length.clone(), Decimal::one())]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        ContractError::OptionDoesNotExists {
+            option: exact_length,
+            gauge_id: 0,
+        },
+        err.downcast().unwrap()
+    );
+
+    let err = suite
+        .place_votes(
+            &gauge_contract,
+            VOTER1.to_owned(),
+            0,
+            Some(vec![("x".repeat(129), Decimal::one())]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        ContractError::StringTooLong {
+            field: "option".to_owned(),
+            max: 128,
+        },
+        err.downcast().unwrap()
+    );
+
+    assert!(suite
+        .query_vote(&gauge_contract, 0, VOTER1)
+        .unwrap()
+        .is_none());
+    assert!(suite
+        .query_selected_set(&gauge_contract, 0)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

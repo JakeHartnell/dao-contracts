@@ -4,6 +4,7 @@ use cw_hooks::Hooks;
 use cw_storage_plus::{Bound, Index, IndexList, IndexedMap, Item, Map, MultiIndex};
 use cw_utils::maybe_addr;
 
+use crate::error::ContractError;
 use crate::msg::VoteInfo;
 
 /// Type alias for u64 to make the map types a bit more self-explanatory
@@ -16,6 +17,14 @@ const LAST_ID: Item<GaugeId> = Item::new("last_id");
 /// Hooks fired on `PlaceVotes`. Owner-managed list; failures auto-unregister
 /// (see the `reply` entry-point).
 pub const VOTE_HOOKS: Hooks = Hooks::new("vote_hooks");
+/// Stable association between a namespaced reply ID and the hook address it
+/// targets. Replies remove this entry regardless of success or failure.
+pub const VOTE_HOOK_REPLIES: Map<u64, Addr> = Map::new("vote_hook_replies");
+pub const NEXT_VOTE_HOOK_REPLY_ID: Item<u64> = Item::new("next_vote_hook_reply_id");
+/// Last option processed by an in-progress reset. The gauge's existing
+/// `last == next` marker records that a reset is active; this cursor ensures
+/// later batches never revisit options already rewritten to zero.
+pub const RESET_CURSOR: Map<GaugeId, String> = Map::new("reset_cursor");
 
 /// Get ID for gauge registration and increment value in storage
 pub fn fetch_last_id(storage: &mut dyn Storage) -> StdResult<u64> {
@@ -35,6 +44,7 @@ pub fn votes() -> Votes<'static> {
 // settings for pagination
 const MAX_LIMIT: u32 = 100;
 const DEFAULT_LIMIT: u32 = 30;
+pub const MAX_GAUGE_VOTES_PER_VOTER: usize = 100;
 
 #[cw_serde]
 pub struct Config {
@@ -149,7 +159,7 @@ struct VoteIndexes<'a> {
     pub vote: MultiIndex<'a, GaugeId, WeightedVotes, (&'a Addr, GaugeId)>,
 }
 
-impl<'a> IndexList<WeightedVotes> for VoteIndexes<'a> {
+impl IndexList<WeightedVotes> for VoteIndexes<'_> {
     fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<WeightedVotes>> + '_> {
         Box::new(std::iter::once(&self.vote as &dyn Index<WeightedVotes>))
     }
@@ -249,6 +259,31 @@ impl<'a> Votes<'a> {
             .collect()
     }
 
+    /// Loads the complete set a power-change hook must process, with one
+    /// lookahead record to detect unsupported legacy state. This must be used
+    /// by every state-changing power hook; the paginated public query is not
+    /// safe for accounting updates.
+    pub fn power_change_votes(
+        &self,
+        deps: Deps,
+        voter_addr: &'a Addr,
+    ) -> Result<Vec<WeightedVotes>, ContractError> {
+        let records = self
+            .votes
+            .prefix(voter_addr)
+            .range(deps.storage, None, None, Order::Ascending)
+            .take(MAX_GAUGE_VOTES_PER_VOTER + 1)
+            .map(|item| item.map(|(_, vote)| vote))
+            .collect::<StdResult<Vec<_>>>()?;
+        if records.len() > MAX_GAUGE_VOTES_PER_VOTER {
+            return Err(ContractError::TooManyGaugeVotes {
+                count: records.len(),
+                max: MAX_GAUGE_VOTES_PER_VOTER,
+            });
+        }
+        Ok(records)
+    }
+
     pub fn query_votes_by_gauge(
         &self,
         deps: Deps,
@@ -290,6 +325,9 @@ pub const TOTAL_CAST: Map<GaugeId, u128> = Map::new("total_power");
 
 /// Count how many points each option has per gauge
 pub const TALLY: Map<(GaugeId, &str), u128> = Map::new("tally");
+/// Removal tombstones retained while stored voter records still reference an
+/// option. Tombstoned options are never selectable or open to new votes.
+pub const INVALID_OPTIONS: Map<(GaugeId, &str), bool> = Map::new("invalid_options");
 /// Sorted index of options by points, separated by gauge - data field is a placeholder
 pub const OPTION_BY_POINTS: Map<(GaugeId, u128, &str), u8> = Map::new("tally_points");
 
@@ -303,27 +341,8 @@ pub fn update_tally(
     option: &str,
     old_vote: u128,
     new_vote: u128,
-) -> StdResult<()> {
+) -> Result<(), ContractError> {
     update_tallies(storage, gauge, vec![(option, old_vote, new_vote)])
-}
-
-/// Completely removes the given option from the tally.
-pub fn remove_tally(storage: &mut dyn Storage, gauge: GaugeId, option: &str) -> StdResult<()> {
-    let old_vote = TALLY.may_load(storage, (gauge, option))?;
-
-    // update main index
-    TALLY.remove(storage, (gauge, option));
-
-    if let Some(old_vote) = old_vote {
-        let total_cast = TOTAL_CAST.may_load(storage, gauge)?.unwrap_or_default();
-        // update total cast
-        TOTAL_CAST.save(storage, gauge, &(total_cast - old_vote))?;
-
-        // update sorted index
-        OPTION_BY_POINTS.remove(storage, (gauge, old_vote, option));
-    }
-
-    Ok(())
 }
 
 /// Updates the tally for one option.
@@ -335,39 +354,66 @@ pub fn update_tallies(
     gauge: GaugeId,
     // (option, old, new)
     updates: Vec<(&str, u128, u128)>,
-) -> StdResult<()> {
+) -> Result<(), ContractError> {
     let mut old_votes = 0u128;
     let mut new_votes = 0u128;
 
     for (option, old_vote, new_vote) in updates {
-        old_votes += old_vote;
-        new_votes += new_vote;
+        old_votes = old_votes
+            .checked_add(old_vote)
+            .ok_or(ContractError::TotalCastOverflow { gauge_id: gauge })?;
+        new_votes = new_votes
+            .checked_add(new_vote)
+            .ok_or(ContractError::TotalCastOverflow { gauge_id: gauge })?;
 
         // get old and new values
         let old_count = TALLY.may_load(storage, (gauge, option))?;
-        let count = old_count.unwrap_or_default() + new_vote - old_vote;
-
-        // update main index
-        TALLY.save(storage, (gauge, option), &count)?;
+        let count = old_count
+            .unwrap_or_default()
+            .checked_add(new_vote)
+            .ok_or_else(|| ContractError::TallyOverflow {
+                gauge_id: gauge,
+                option: option.to_string(),
+            })?
+            .checked_sub(old_vote)
+            .ok_or_else(|| ContractError::TallyUnderflow {
+                gauge_id: gauge,
+                option: option.to_string(),
+            })?;
 
         // delete old secondary index (if any)
         if let Some(old) = old_count {
             OPTION_BY_POINTS.remove(storage, (gauge, old, option));
         }
-        // add new secondary index
-        OPTION_BY_POINTS.save(storage, (gauge, count, option), &1u8)?;
+
+        let invalid = INVALID_OPTIONS.has(storage, (gauge, option));
+        // A zero tally does not prove no stored vote references the option:
+        // a zero-power voter may later stake again. Keep the tombstone until
+        // reset performs bounded cleanup, otherwise that later power hook
+        // would recreate the removed option as active and selectable.
+        TALLY.save(storage, (gauge, option), &count)?;
+        if !invalid {
+            OPTION_BY_POINTS.save(storage, (gauge, count, option), &1u8)?;
+        }
     }
 
     // update total count
     let total = TOTAL_CAST.may_load(storage, gauge)?.unwrap_or_default();
-    let total = total + new_votes - old_votes;
-    TOTAL_CAST.save(storage, gauge, &total)
+    let total = total
+        .checked_add(new_votes)
+        .ok_or(ContractError::TotalCastOverflow { gauge_id: gauge })?
+        .checked_sub(old_votes)
+        .ok_or(ContractError::TotalCastUnderflow { gauge_id: gauge })?;
+    TOTAL_CAST.save(storage, gauge, &total)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cosmwasm_std::Order;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use cosmwasm_std::testing::{mock_dependencies, mock_env};
 
@@ -423,6 +469,34 @@ mod tests {
         // total is properly set
         let total = TOTAL_CAST.load(deps.storage, GAUGE).unwrap();
         assert_eq!(total, 750u128);
+    }
+
+    #[test]
+    fn tally_arithmetic_returns_domain_errors_at_numeric_boundaries() {
+        let mut deps = mock_dependencies();
+        update_tally(&mut deps.storage, GAUGE, OPTION1, 0, u128::MAX).unwrap();
+        assert_eq!(
+            update_tally(&mut deps.storage, GAUGE, OPTION1, 0, 1).unwrap_err(),
+            ContractError::TallyOverflow {
+                gauge_id: GAUGE,
+                option: OPTION1.to_owned()
+            }
+        );
+
+        update_tally(&mut deps.storage, 77, OPTION2, 0, 0).unwrap();
+        assert_eq!(
+            update_tally(&mut deps.storage, 77, OPTION2, 1, 0).unwrap_err(),
+            ContractError::TallyUnderflow {
+                gauge_id: 77,
+                option: OPTION2.to_owned()
+            }
+        );
+
+        // A second option can fit its own tally but not the aggregate total.
+        assert_eq!(
+            update_tally(&mut deps.storage, GAUGE, OPTION2, 0, 1).unwrap_err(),
+            ContractError::TotalCastOverflow { gauge_id: GAUGE }
+        );
     }
 
     fn to_vote_info(voter: &Addr, votes: &[Vote], cast: impl Into<Option<u64>>) -> VoteInfo {
@@ -720,5 +794,200 @@ mod tests {
             .query_votes_by_voter(deps.as_ref(), &user1, Some(2), None)
             .unwrap();
         assert_eq!(result, vec![vote2, vote3]);
+    }
+
+    #[test]
+    fn power_change_votes_enforces_complete_iteration_boundary() {
+        let mut deps = mock_dependencies();
+        let voter = Addr::unchecked("boundary-voter");
+        let store = votes();
+        let vote = |gauge_id| WeightedVotes {
+            gauge_id,
+            power: Uint128::one(),
+            votes: vec![Vote {
+                option: "option".to_owned(),
+                weight: Decimal::one(),
+            }],
+            cast: Some(mock_env().block.time.seconds()),
+        };
+
+        for gauge_id in 0..(MAX_GAUGE_VOTES_PER_VOTER - 1) as u64 {
+            store
+                .save(&mut deps.storage, &voter, gauge_id, &vote(gauge_id))
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .power_change_votes(deps.as_ref(), &voter)
+                .unwrap()
+                .len(),
+            MAX_GAUGE_VOTES_PER_VOTER - 1
+        );
+
+        let at = (MAX_GAUGE_VOTES_PER_VOTER - 1) as u64;
+        store
+            .save(&mut deps.storage, &voter, at, &vote(at))
+            .unwrap();
+        assert_eq!(
+            store
+                .power_change_votes(deps.as_ref(), &voter)
+                .unwrap()
+                .len(),
+            MAX_GAUGE_VOTES_PER_VOTER
+        );
+
+        let over = MAX_GAUGE_VOTES_PER_VOTER as u64;
+        store
+            .save(&mut deps.storage, &voter, over, &vote(over))
+            .unwrap();
+        assert_eq!(
+            store.power_change_votes(deps.as_ref(), &voter).unwrap_err(),
+            ContractError::TooManyGaugeVotes {
+                count: MAX_GAUGE_VOTES_PER_VOTER + 1,
+                max: MAX_GAUGE_VOTES_PER_VOTER
+            }
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Randomized reference-model test for the core accounting state
+        /// machine. Each operation replaces/clears a vote or changes its power,
+        /// then independently reconstructs all contributions from stored voter
+        /// records and audits both primary and secondary indices.
+        #[test]
+        fn randomized_vote_and_power_sequences_preserve_all_indices(
+            operations in prop::collection::vec(
+                (0usize..4, 0u8..5, 0usize..4, 0usize..4, 1u64..10_000, 1u64..100),
+                1..200,
+            )
+        ) {
+            const OPTIONS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
+            let mut deps = mock_dependencies();
+            let env = mock_env();
+            let store = votes();
+            let voters = (0..4)
+                .map(|index| Addr::unchecked(format!("property-voter-{index}")))
+                .collect::<Vec<_>>();
+
+            for option in OPTIONS {
+                update_tally(&mut deps.storage, GAUGE, option, 0, 0).unwrap();
+            }
+
+            for (voter_index, action, first, second, raw_power, split) in operations {
+                let voter = &voters[voter_index];
+                let old = store.may_load(&deps.storage, voter, GAUGE).unwrap();
+                let old_power = old.as_ref().map(|vote| vote.power).unwrap_or_default();
+                let old_votes = old.as_ref().map(|vote| vote.votes.clone()).unwrap_or_default();
+
+                let (new_power, new_votes) = match action {
+                    0 => (Uint128::zero(), vec![]),
+                    1 => (
+                        Uint128::new(raw_power as u128),
+                        vec![Vote {
+                            option: OPTIONS[first].to_owned(),
+                            weight: Decimal::one(),
+                        }],
+                    ),
+                    2 if first != second => (
+                        Uint128::new(raw_power as u128),
+                        vec![
+                            Vote {
+                                option: OPTIONS[first].to_owned(),
+                                weight: Decimal::percent(split),
+                            },
+                            Vote {
+                                option: OPTIONS[second].to_owned(),
+                                weight: Decimal::percent(100 - split),
+                            },
+                        ],
+                    ),
+                    // Power-change operation keeps the current allocation.
+                    3 if old.is_some() => (Uint128::new(raw_power as u128), old_votes.clone()),
+                    _ => (
+                        Uint128::new(raw_power as u128),
+                        vec![Vote {
+                            option: OPTIONS[first].to_owned(),
+                            weight: Decimal::percent(split),
+                        }],
+                    ),
+                };
+
+                let contribution = |votes: &[Vote], power: Uint128, option: &str| {
+                    votes
+                        .iter()
+                        .find(|vote| vote.option == option)
+                        .map(|vote| (power * vote.weight).u128())
+                        .unwrap_or_default()
+                };
+                let updates = OPTIONS
+                    .iter()
+                    .map(|option| {
+                        (
+                            *option,
+                            contribution(&old_votes, old_power, option),
+                            contribution(&new_votes, new_power, option),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                update_tallies(&mut deps.storage, GAUGE, updates).unwrap();
+
+                if new_votes.is_empty() {
+                    store.remove_votes(&mut deps.storage, voter, GAUGE).unwrap();
+                } else {
+                    store
+                        .set_votes(
+                            &mut deps.storage,
+                            &env,
+                            voter,
+                            GAUGE,
+                            new_votes,
+                            new_power,
+                        )
+                        .unwrap();
+                }
+
+                let mut expected = OPTIONS
+                    .iter()
+                    .map(|option| ((*option).to_owned(), 0u128))
+                    .collect::<BTreeMap<_, _>>();
+                for item in store
+                    .votes
+                    .range(&deps.storage, None, None, Order::Ascending)
+                {
+                    let ((_voter, gauge), record) = item.unwrap();
+                    if gauge == GAUGE {
+                        for vote in record.votes {
+                            *expected.get_mut(&vote.option).unwrap() +=
+                                (record.power * vote.weight).u128();
+                        }
+                    }
+                }
+
+                let tallies = TALLY
+                    .prefix(GAUGE)
+                    .range(&deps.storage, None, None, Order::Ascending)
+                    .collect::<StdResult<BTreeMap<_, _>>>()
+                    .unwrap();
+                prop_assert_eq!(&tallies, &expected);
+                prop_assert_eq!(
+                    TOTAL_CAST.load(&deps.storage, GAUGE).unwrap(),
+                    expected.values().copied().sum::<u128>()
+                );
+
+                let index = OPTION_BY_POINTS
+                    .sub_prefix(GAUGE)
+                    .keys(&deps.storage, None, None, Order::Ascending)
+                    .collect::<StdResult<Vec<_>>>()
+                    .unwrap();
+                let expected_index = expected
+                    .iter()
+                    .map(|(option, points)| (*points, option.clone()))
+                    .collect::<BTreeSet<_>>();
+                prop_assert_eq!(index.len(), OPTIONS.len());
+                prop_assert_eq!(index.into_iter().collect::<BTreeSet<_>>(), expected_index);
+            }
+        }
     }
 }

@@ -31,10 +31,11 @@ use super::adapter::{
     InstantiateMsg as AdapterInstantiateMsg,
 };
 use crate::msg::{
-    ExecuteMsg, GaugeConfig, GaugeMigrationConfig, GaugeResponse, InstantiateMsg,
-    LastExecutedSetResponse, ListGaugesResponse, ListOptionsResponse, ListVotesResponse,
-    MigrateMsg, QueryMsg, SelectedSetResponse, VoteInfo, VoteResponse,
+    ExecuteMsg, GaugeConfig, GaugeHealthResponse, GaugeMigrationConfig, GaugeResponse,
+    InstantiateMsg, LastExecutedSetResponse, ListGaugesResponse, ListOptionsResponse,
+    ListVotesResponse, MigrateMsg, QueryMsg, SelectedSetResponse, VoteInfo, VoteResponse,
 };
+use crate::ContractError;
 
 type GaugeId = u64;
 
@@ -45,6 +46,31 @@ fn store_gauge(app: &mut App) -> u64 {
         ContractWrapper::new_with_empty(
             crate::contract::execute,
             crate::contract::instantiate,
+            crate::contract::query,
+        )
+        .with_migrate(crate::contract::migrate)
+        .with_reply_empty(crate::contract::reply),
+    );
+
+    app.store_code(contract)
+}
+
+fn legacy_gauge_instantiate(
+    mut deps: cosmwasm_std::DepsMut,
+    env: cosmwasm_std::Env,
+    info: cosmwasm_std::MessageInfo,
+    msg: InstantiateMsg,
+) -> Result<cosmwasm_std::Response, ContractError> {
+    let response = crate::contract::instantiate(deps.branch(), env, info, msg)?;
+    cw2::set_contract_version(deps.storage, "crates.io:gauge", "2.5.0")?;
+    Ok(response)
+}
+
+fn store_legacy_gauge(app: &mut App) -> u64 {
+    let contract = Box::new(
+        ContractWrapper::new_with_empty(
+            crate::contract::execute,
+            legacy_gauge_instantiate,
             crate::contract::query,
         )
         .with_migrate(crate::contract::migrate)
@@ -233,7 +259,8 @@ impl SuiteBuilder {
             )
             .unwrap();
 
-        let gauge_code_id = store_gauge(&mut app);
+        let gauge_code_id = store_legacy_gauge(&mut app);
+        let gauge_migrate_code_id = store_gauge(&mut app);
         let gauge_adapter_code_id = app.store_code(adapter_contract());
 
         Suite {
@@ -244,6 +271,7 @@ impl SuiteBuilder {
             voting: voting_contract,
             proposal_single: proposal_single_contract[0].address.clone(),
             gauge_code_id,
+            gauge_migrate_code_id,
             gauge_adapter_code_id,
         }
     }
@@ -257,6 +285,7 @@ pub struct Suite {
     pub voting: Addr,
     pub proposal_single: Addr,
     pub gauge_code_id: u64,
+    pub gauge_migrate_code_id: u64,
     pub gauge_adapter_code_id: u64,
 }
 
@@ -293,6 +322,20 @@ impl Suite {
             Addr::unchecked(sender),
             gauge.clone(),
             &ExecuteMsg::StopGauge { gauge: gauge_id },
+            &[],
+        )
+    }
+
+    pub fn resume_gauge(
+        &mut self,
+        gauge: &Addr,
+        sender: impl Into<String>,
+        gauge_id: u64,
+    ) -> AnyResult<AppResponse> {
+        self.app.execute_contract(
+            Addr::unchecked(sender),
+            gauge.clone(),
+            &ExecuteMsg::ResumeGauge { gauge: gauge_id },
             &[],
         )
     }
@@ -365,6 +408,19 @@ impl Suite {
         )
     }
 
+    pub fn set_adapter_return_empty(
+        &mut self,
+        gauge_adapter: &Addr,
+        enabled: bool,
+    ) -> AnyResult<AppResponse> {
+        self.app.execute_contract(
+            Addr::unchecked(self.owner.clone()),
+            gauge_adapter.clone(),
+            &AdapterExecuteMsg::SetReturnEmpty { enabled },
+            &[],
+        )
+    }
+
     /// Helper to vote for a single option
     pub fn place_vote(
         &mut self,
@@ -422,6 +478,16 @@ impl Suite {
         self.app
             .wrap()
             .query_wasm_smart(gauge_contract, &QueryMsg::Gauge { id })
+    }
+
+    pub fn query_gauge_health(
+        &self,
+        gauge_contract: &Addr,
+        id: u64,
+    ) -> StdResult<GaugeHealthResponse> {
+        self.app
+            .wrap()
+            .query_wasm_smart(gauge_contract, &QueryMsg::GaugeHealth { gauge: id })
     }
 
     pub fn query_gauges(&self, gauge_contract: Addr) -> StdResult<Vec<GaugeResponse>> {
@@ -625,6 +691,24 @@ impl Suite {
         max_available_percentage: impl Into<Option<Decimal>>,
         reset_epoch: impl Into<Option<u64>>,
     ) -> AnyResult<Addr> {
+        self.instantiate_adapter_and_create_gauge_with_response(
+            gauge_contract,
+            options,
+            to_distribute,
+            max_available_percentage,
+            reset_epoch,
+        )
+        .map(|(adapter, _)| adapter)
+    }
+
+    pub fn instantiate_adapter_and_create_gauge_with_response(
+        &mut self,
+        gauge_contract: Addr,
+        options: &[&str],
+        to_distribute: (u128, &str),
+        max_available_percentage: impl Into<Option<Decimal>>,
+        reset_epoch: impl Into<Option<u64>>,
+    ) -> AnyResult<(Addr, AppResponse)> {
         let option = self.instantiate_adapter_and_return_config(
             options,
             to_distribute,
@@ -632,13 +716,13 @@ impl Suite {
             reset_epoch,
         )?;
         let gauge_adapter = option.adapter.clone();
-        self.app.execute_contract(
+        let response = self.app.execute_contract(
             Addr::unchecked(&self.owner),
             gauge_contract,
             &ExecuteMsg::CreateGauge(option),
             &[],
         )?;
-        Ok(Addr::unchecked(gauge_adapter))
+        Ok((Addr::unchecked(gauge_adapter), response))
     }
 
     pub fn instantiate_adapter_and_return_config(
@@ -802,7 +886,7 @@ impl Suite {
             &MigrateMsg {
                 gauge_config: gauge_config.into(),
             },
-            self.gauge_code_id,
+            self.gauge_migrate_code_id,
         )
     }
 }

@@ -27,6 +27,9 @@ pub enum ContractError {
     #[error("Invalid submission - invalid amount for required deposit. Either multiple denoms were sent or amount does not match {correct_amount}")]
     InvalidDepositAmount { correct_amount: Uint128 },
 
+    #[error("Required deposit amount must be greater than zero")]
+    ZeroRequiredDeposit {},
+
     #[error("No deposit was required, therefore no deposit can be returned")]
     NoDepositToRefund {},
 
@@ -35,4 +38,31 @@ pub enum ContractError {
 
     #[error("Cannot reject the default community-pool submission")]
     CannotRejectDefault {},
+
+    #[error("Submission metadata updates must not include another deposit")]
+    DepositOnMetadataUpdate {},
+
+    #[error("Submission creation is paused while bulk refunds are in progress")]
+    RefundInProgress {},
+
+    #[error("Bond liability arithmetic overflowed")]
+    LiabilityOverflow {},
+
+    #[error("Bond liability accounting underflowed")]
+    LiabilityUnderflow {},
+
+    #[error("Bond escrow shortfall: balance {balance}, liabilities {liabilities}")]
+    EscrowShortfall {
+        balance: Uint128,
+        liabilities: Uint128,
+    },
+
+    #[error("Submission limit reached; maximum is {max}")]
+    TooManySubmissions { max: usize },
+
+    #[error("Unsupported migration source version {version}")]
+    UnsupportedMigrationSource { version: String },
+
+    #[error("{field} exceeds maximum byte length {max}")]
+    StringTooLong { field: String, max: usize },
 }

@@ -5,7 +5,7 @@ use cosmwasm_std::Coin;
 // downstream consumers can depend on either adapter through one type
 // surface. Crates that only need the orchestrator-facing surface can
 // `use gauge_adapter::msg::AdapterQueryMsg`.
-pub use gauge_adapter::msg::{
+pub use gauge_interface::{
     AdapterQueryMsg, AllOptionsResponse, CheckOptionResponse, SampleGaugeMsgsResponse,
 };
 
@@ -41,7 +41,10 @@ pub enum QueryMsg {
     Config {},
     /// All currently-valid options (proxy for `AdapterQueryMsg::AllOptions`).
     #[returns(AllOptionsResponse)]
-    AllOptions {},
+    AllOptions {
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
     /// Check whether `option` is in the valid set.
     #[returns(CheckOptionResponse)]
     CheckOption { option: String },
@@ -53,5 +56,36 @@ pub enum QueryMsg {
     },
 }
 
-#[cw_serde]
-pub enum MigrateMsg {}
+#[cfg(test)]
+mod schema_smoke_tests {
+    use super::*;
+    use cosmwasm_std::{from_json, to_json_binary};
+
+    #[test]
+    fn representative_external_payloads_deserialize() {
+        let _: InstantiateMsg = from_json(
+            br#"{"owner":"owner","options":["recipient"],"epoch_budget":{"denom":"ujuno","amount":"5000"}}"#,
+        )
+        .unwrap();
+        let _: ExecuteMsg = from_json(br#"{"add_option":{"option":"recipient2"}}"#).unwrap();
+        let _: QueryMsg =
+            from_json(br#"{"sample_gauge_msgs":{"selected":[["recipient","0.75"]]}}"#).unwrap();
+        let _: SampleGaugeMsgsResponse = from_json(br#"{"execute":[]}"#).unwrap();
+
+        for protocol in [
+            AdapterQueryMsg::AllOptions {
+                start_after: None,
+                limit: Some(25),
+            },
+            AdapterQueryMsg::CheckOption {
+                option: "recipient".to_owned(),
+            },
+            AdapterQueryMsg::SampleGaugeMsgs {
+                selected: vec![("recipient".to_owned(), cosmwasm_std::Decimal::percent(50))],
+            },
+        ] {
+            let encoded = to_json_binary(&protocol).unwrap();
+            let _: QueryMsg = from_json(encoded).unwrap();
+        }
+    }
+}

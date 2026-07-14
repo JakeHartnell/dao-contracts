@@ -1,6 +1,6 @@
 use cosmwasm_schema::write_api;
 
-use gauge_budget_allocator::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
+use gauge_adapter::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 
 fn main() {
     write_api! {

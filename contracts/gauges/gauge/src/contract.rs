@@ -4,8 +4,9 @@ use cosmwasm_std::{
     ensure, to_json_binary, Addr, Binary, Decimal, Deps, DepsMut, Env, MessageInfo, Order,
     QueryRequest, Reply, Response, StdError, StdResult, Uint128, WasmMsg, WasmQuery,
 };
-use cw2::{ensure_from_older_version, set_contract_version};
+use cw2::{ensure_from_older_version, get_contract_version, set_contract_version};
 use cw_storage_plus::Bound;
+use cw_utils::nonpayable;
 use dao_interface::{
     msg::ExecuteMsg as DaoExecuteMsg,
     voting::{Query as DaoQuery, VotingPowerAtHeightResponse},
@@ -13,19 +14,30 @@ use dao_interface::{
 
 use crate::hooks::new_vote_hook_msgs;
 use crate::msg::{
-    AdapterQueryMsg, AllOptionsResponse, CheckOptionResponse, ExecuteMsg, GaugeConfig,
-    GaugeResponse, GetHooksResponse, InstantiateMsg, ListGaugesResponse, ListOptionsResponse,
-    ListVotesResponse, MigrateMsg, QueryMsg, SampleGaugeMsgsResponse, SelectedSetResponse,
+    AdapterQueryMsg, AllOptionsResponse, CheckOptionResponse, ConfigResponse, CreateGaugeReply,
+    ExecuteMsg, GaugeConfig, GaugeResponse, GetHooksResponse, InstantiateMsg, ListGaugesResponse,
+    ListOptionsResponse, ListVotesResponse, MigrateMsg, QueryMsg, SampleGaugeMsgsResponse,
+    SelectedSetResponse,
 };
 use crate::state::{
-    fetch_last_id, update_tally, votes, Config, Gauge, GaugeId, CONFIG, GAUGES, OPTION_BY_POINTS,
-    TALLY, TOTAL_CAST, VOTE_HOOKS,
+    fetch_last_id, update_tally, votes, Config, Gauge, GaugeId, CONFIG, GAUGES, INVALID_OPTIONS,
+    MAX_GAUGE_VOTES_PER_VOTER, OPTION_BY_POINTS, RESET_CURSOR, TALLY, TOTAL_CAST, VOTE_HOOKS,
+    VOTE_HOOK_REPLIES,
 };
 use crate::{error::ContractError, state::Reset};
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:gauge";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SUPPORTED_MIGRATION_SOURCES: &[&str] = &["2.4.2", "2.5.0"];
+const MAX_GAUGES: u64 = 100;
+const MAX_OPTIONS_PER_GAUGE: usize = 100;
+const MAX_VOTE_HOOKS: u32 = 10;
+const MAX_ADAPTER_MESSAGES: usize = 100;
+const MAX_HOOK_MEMBERS: usize = 100;
+const MAX_NFT_HOOK_TOKENS: usize = 100;
+const MAX_TITLE_BYTES: usize = 128;
+const MAX_OPTION_BYTES: usize = 128;
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
@@ -53,8 +65,771 @@ pub fn instantiate(
 
     Ok(Response::new()
         .add_attribute("action", "instantiate")
+        .add_attribute("dao_core", &config.dao_core)
         .add_attribute("owner", &msg.owner)
-        .add_attribute("voting_powers", &msg.voting_powers))
+        .add_attribute("voting_powers", &msg.voting_powers)
+        .add_attribute("hook_caller", &msg.hook_caller))
+}
+
+#[cfg(test)]
+mod health_query_tests {
+    use super::*;
+    use cosmwasm_std::testing::{mock_dependencies, mock_env};
+    use cosmwasm_std::{
+        from_json, to_json_binary, BankMsg, ContractResult, CosmosMsg, SystemResult, WasmQuery,
+    };
+
+    #[test]
+    fn gauge_health_reports_and_then_clears_index_mismatch() {
+        let mut deps = mock_dependencies();
+        GAUGES
+            .save(
+                deps.as_mut().storage,
+                7,
+                &Gauge {
+                    title: "health".to_owned(),
+                    adapter: Addr::unchecked("adapter"),
+                    epoch: 600,
+                    min_percent_selected: None,
+                    max_options_selected: 10,
+                    max_available_percentage: None,
+                    is_stopped: false,
+                    next_epoch: 1_000,
+                    last_executed_set: None,
+                    reset: None,
+                },
+            )
+            .unwrap();
+        TALLY
+            .save(deps.as_mut().storage, (7, "alpha"), &10)
+            .unwrap();
+        TOTAL_CAST.save(deps.as_mut().storage, 7, &10).unwrap();
+
+        let broken = query::gauge_health(deps.as_ref(), 7).unwrap();
+        assert!(!broken.consistent);
+        assert_eq!(broken.mismatch_count, 1);
+        assert_eq!(broken.first_mismatch.as_deref(), Some("alpha"));
+
+        OPTION_BY_POINTS
+            .save(deps.as_mut().storage, (7, 10, "alpha"), &1)
+            .unwrap();
+        let repaired = query::gauge_health(deps.as_ref(), 7).unwrap();
+        assert!(repaired.consistent);
+        assert_eq!(repaired.mismatch_count, 0);
+        assert_eq!(repaired.first_mismatch, None);
+    }
+
+    #[test]
+    fn invalid_leader_does_not_hide_valid_candidate_below_selection_cap() {
+        let mut deps = mock_dependencies();
+        GAUGES
+            .save(
+                deps.as_mut().storage,
+                7,
+                &Gauge {
+                    title: "adapter-validity".to_owned(),
+                    adapter: Addr::unchecked("adapter"),
+                    epoch: 600,
+                    min_percent_selected: None,
+                    max_options_selected: 1,
+                    max_available_percentage: None,
+                    is_stopped: false,
+                    next_epoch: 1_000,
+                    last_executed_set: None,
+                    reset: None,
+                },
+            )
+            .unwrap();
+        for (option, power) in [("rejected-leader", 100u128), ("valid-runner-up", 50)] {
+            TALLY
+                .save(deps.as_mut().storage, (7, option), &power)
+                .unwrap();
+            OPTION_BY_POINTS
+                .save(deps.as_mut().storage, (7, power, option), &1)
+                .unwrap();
+        }
+        TOTAL_CAST.save(deps.as_mut().storage, 7, &150).unwrap();
+        deps.querier.update_wasm(|query| match query {
+            WasmQuery::Smart { msg, .. } => {
+                let AdapterQueryMsg::CheckOption { option } = from_json(msg).unwrap() else {
+                    unreachable!()
+                };
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&CheckOptionResponse {
+                        valid: option == "valid-runner-up",
+                    })
+                    .unwrap(),
+                ))
+            }
+            _ => unreachable!(),
+        });
+
+        assert_eq!(
+            query::selected_set(deps.as_ref(), 7).unwrap().votes,
+            vec![("valid-runner-up".to_owned(), Uint128::new(50))]
+        );
+    }
+
+    #[test]
+    fn reset_makes_bounded_progress_across_batch_boundaries() {
+        const GAUGE_ID: u64 = 7;
+        const BATCH_SIZE: u32 = 4;
+
+        for option_count in [0usize, 1, 3, 4, 5, 9] {
+            let mut deps = mock_dependencies();
+            let mut env = mock_env();
+            env.block.time = env.block.time.plus_seconds(1_000);
+            let reset_deadline = env.block.time.seconds();
+
+            GAUGES
+                .save(
+                    deps.as_mut().storage,
+                    GAUGE_ID,
+                    &Gauge {
+                        title: "reset-boundary".to_owned(),
+                        adapter: Addr::unchecked("adapter"),
+                        epoch: 600,
+                        min_percent_selected: None,
+                        max_options_selected: 10,
+                        max_available_percentage: None,
+                        is_stopped: false,
+                        next_epoch: reset_deadline + 600,
+                        last_executed_set: None,
+                        reset: Some(Reset {
+                            last: None,
+                            reset_each: 100,
+                            next: reset_deadline,
+                        }),
+                    },
+                )
+                .unwrap();
+
+            let mut total = 0u128;
+            for index in 0..option_count {
+                let option = format!("option-{index:03}");
+                // Deliberately vary points so reset proves both primary and
+                // sorted index updates rather than only rewriting equal keys.
+                let points = index as u128 + 1;
+                total += points;
+                TALLY
+                    .save(deps.as_mut().storage, (GAUGE_ID, &option), &points)
+                    .unwrap();
+                OPTION_BY_POINTS
+                    .save(deps.as_mut().storage, (GAUGE_ID, points, &option), &1)
+                    .unwrap();
+            }
+            TOTAL_CAST
+                .save(deps.as_mut().storage, GAUGE_ID, &total)
+                .unwrap();
+
+            let expected_calls = option_count.div_ceil(BATCH_SIZE as usize).max(1);
+            for call in 0..expected_calls {
+                let response = execute::reset_gauge(
+                    deps.as_mut(),
+                    env.clone(),
+                    Addr::unchecked("keeper"),
+                    GAUGE_ID,
+                    BATCH_SIZE,
+                )
+                .unwrap();
+                let complete = response
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.key == "complete")
+                    .unwrap()
+                    .value
+                    == "true";
+                assert_eq!(complete, call + 1 == expected_calls, "count={option_count}");
+
+                if !complete {
+                    assert!(RESET_CURSOR.has(deps.as_ref().storage, GAUGE_ID));
+                    assert!(GAUGES
+                        .load(deps.as_ref().storage, GAUGE_ID)
+                        .unwrap()
+                        .is_resetting());
+                }
+            }
+
+            let gauge = GAUGES.load(deps.as_ref().storage, GAUGE_ID).unwrap();
+            assert!(!gauge.is_resetting(), "count={option_count}");
+            assert_eq!(gauge.reset.unwrap().next, reset_deadline + 100);
+            assert!(!RESET_CURSOR.has(deps.as_ref().storage, GAUGE_ID));
+            assert_eq!(TOTAL_CAST.load(deps.as_ref().storage, GAUGE_ID).unwrap(), 0);
+
+            let tallies = TALLY
+                .prefix(GAUGE_ID)
+                .range(deps.as_ref().storage, None, None, Order::Ascending)
+                .collect::<StdResult<Vec<_>>>()
+                .unwrap();
+            assert_eq!(tallies.len(), option_count);
+            assert!(tallies.iter().all(|(_, points)| *points == 0));
+
+            let sorted = OPTION_BY_POINTS
+                .sub_prefix(GAUGE_ID)
+                .range(deps.as_ref().storage, None, None, Order::Ascending)
+                .collect::<StdResult<Vec<_>>>()
+                .unwrap();
+            assert_eq!(sorted.len(), option_count);
+            assert!(sorted.iter().all(|((points, _), _)| *points == 0));
+        }
+    }
+
+    #[test]
+    fn member_changes_update_tombstoned_option_without_restoring_its_index() {
+        use crate::state::{votes, Vote, WeightedVotes};
+        use cw4::MemberDiff;
+
+        const GAUGE_ID: u64 = 7;
+        let mut deps = mock_dependencies();
+        let hook = Addr::unchecked("membership-hook");
+        CONFIG
+            .save(
+                deps.as_mut().storage,
+                &Config {
+                    voting_powers: Addr::unchecked("voting-powers"),
+                    hook_caller: hook.clone(),
+                    owner: Addr::unchecked("owner"),
+                    dao_core: Addr::unchecked("dao"),
+                },
+            )
+            .unwrap();
+        GAUGES
+            .save(
+                deps.as_mut().storage,
+                GAUGE_ID,
+                &Gauge {
+                    title: "removed-option-hook".to_owned(),
+                    adapter: Addr::unchecked("adapter"),
+                    epoch: 600,
+                    min_percent_selected: None,
+                    max_options_selected: 10,
+                    max_available_percentage: None,
+                    is_stopped: false,
+                    next_epoch: 1_000,
+                    last_executed_set: None,
+                    reset: None,
+                },
+            )
+            .unwrap();
+
+        let option = "removed";
+        TALLY
+            .save(deps.as_mut().storage, (GAUGE_ID, option), &300)
+            .unwrap();
+        TOTAL_CAST
+            .save(deps.as_mut().storage, GAUGE_ID, &300)
+            .unwrap();
+        INVALID_OPTIONS
+            .save(deps.as_mut().storage, (GAUGE_ID, option), &true)
+            .unwrap();
+
+        for (voter, power) in [("alice", 100u128), ("bob", 200u128)] {
+            let voter = Addr::unchecked(voter);
+            votes()
+                .save(
+                    deps.as_mut().storage,
+                    &voter,
+                    GAUGE_ID,
+                    &WeightedVotes {
+                        gauge_id: GAUGE_ID,
+                        power: Uint128::new(power),
+                        votes: vec![Vote {
+                            option: option.to_owned(),
+                            weight: Decimal::one(),
+                        }],
+                        cast: Some(mock_env().block.time.seconds()),
+                    },
+                )
+                .unwrap();
+        }
+
+        let response = execute::member_changed(
+            deps.as_mut(),
+            hook,
+            vec![
+                MemberDiff {
+                    key: "alice".to_owned(),
+                    old: Some(100),
+                    new: Some(150),
+                },
+                MemberDiff {
+                    key: "bob".to_owned(),
+                    old: Some(200),
+                    new: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(response
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key == "updated_votes" && attribute.value == "2"));
+        assert_eq!(
+            TALLY
+                .load(deps.as_ref().storage, (GAUGE_ID, option))
+                .unwrap(),
+            150
+        );
+        assert_eq!(
+            TOTAL_CAST.load(deps.as_ref().storage, GAUGE_ID).unwrap(),
+            150
+        );
+        assert!(INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, option)));
+        assert!(!OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 150, option)));
+        assert_eq!(
+            votes()
+                .load(deps.as_ref().storage, &Addr::unchecked("alice"), GAUGE_ID,)
+                .unwrap()
+                .power,
+            Uint128::new(150)
+        );
+        assert_eq!(
+            votes()
+                .load(deps.as_ref().storage, &Addr::unchecked("bob"), GAUGE_ID,)
+                .unwrap()
+                .power,
+            Uint128::zero()
+        );
+    }
+
+    #[test]
+    fn zero_power_then_restake_cannot_reactivate_tombstoned_option() {
+        use crate::state::{votes, Vote, WeightedVotes};
+        use cw4::MemberDiff;
+        use dao_hooks::stake::StakeChangedHookMsg;
+
+        const GAUGE_ID: u64 = 7;
+        let mut deps = mock_dependencies();
+        let hook = Addr::unchecked("staking-hook");
+        CONFIG
+            .save(
+                deps.as_mut().storage,
+                &Config {
+                    voting_powers: Addr::unchecked("voting-powers"),
+                    hook_caller: hook.clone(),
+                    owner: Addr::unchecked("owner"),
+                    dao_core: Addr::unchecked("dao"),
+                },
+            )
+            .unwrap();
+        GAUGES
+            .save(
+                deps.as_mut().storage,
+                GAUGE_ID,
+                &Gauge {
+                    title: "removed-option-restake".to_owned(),
+                    adapter: Addr::unchecked("adapter"),
+                    epoch: 600,
+                    min_percent_selected: None,
+                    max_options_selected: 10,
+                    max_available_percentage: None,
+                    is_stopped: false,
+                    next_epoch: 1_000,
+                    last_executed_set: None,
+                    reset: None,
+                },
+            )
+            .unwrap();
+
+        let voter = Addr::unchecked("alice");
+        let option = "removed";
+        TALLY
+            .save(deps.as_mut().storage, (GAUGE_ID, option), &100)
+            .unwrap();
+        TOTAL_CAST
+            .save(deps.as_mut().storage, GAUGE_ID, &100)
+            .unwrap();
+        INVALID_OPTIONS
+            .save(deps.as_mut().storage, (GAUGE_ID, option), &true)
+            .unwrap();
+        votes()
+            .save(
+                deps.as_mut().storage,
+                &voter,
+                GAUGE_ID,
+                &WeightedVotes {
+                    gauge_id: GAUGE_ID,
+                    power: Uint128::new(100),
+                    votes: vec![Vote {
+                        option: option.to_owned(),
+                        weight: Decimal::one(),
+                    }],
+                    cast: Some(mock_env().block.time.seconds()),
+                },
+            )
+            .unwrap();
+
+        execute::member_changed(
+            deps.as_mut(),
+            hook.clone(),
+            vec![MemberDiff {
+                key: voter.to_string(),
+                old: Some(100),
+                new: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            TALLY
+                .load(deps.as_ref().storage, (GAUGE_ID, option))
+                .unwrap(),
+            0
+        );
+        assert!(INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, option)));
+        assert!(!OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 0, option)));
+
+        execute::stake_changed(
+            deps.as_mut(),
+            MessageInfo {
+                sender: hook,
+                funds: vec![],
+            },
+            StakeChangedHookMsg::Stake {
+                addr: voter,
+                amount: Uint128::new(50),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            TALLY
+                .load(deps.as_ref().storage, (GAUGE_ID, option))
+                .unwrap(),
+            50
+        );
+        assert_eq!(
+            TOTAL_CAST.load(deps.as_ref().storage, GAUGE_ID).unwrap(),
+            50
+        );
+        assert!(INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, option)));
+        assert!(!OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 50, option)));
+    }
+
+    #[test]
+    fn power_hooks_reject_oversized_batches_before_mutating_state() {
+        use cw4::MemberDiff;
+        use dao_hooks::nft_stake::NftStakeChangedHookMsg;
+
+        let mut deps = mock_dependencies();
+        let hook = Addr::unchecked("hook-caller");
+        CONFIG
+            .save(
+                deps.as_mut().storage,
+                &Config {
+                    voting_powers: Addr::unchecked("voting-powers"),
+                    hook_caller: hook.clone(),
+                    owner: Addr::unchecked("owner"),
+                    dao_core: Addr::unchecked("dao"),
+                },
+            )
+            .unwrap();
+
+        for count in [MAX_HOOK_MEMBERS - 1, MAX_HOOK_MEMBERS] {
+            let diffs = (0..count)
+                .map(|index| MemberDiff {
+                    key: format!("accepted-member-{count}-{index}"),
+                    old: None,
+                    new: Some(1),
+                })
+                .collect::<Vec<_>>();
+            execute::member_changed(deps.as_mut(), hook.clone(), diffs).unwrap();
+        }
+
+        let diffs = (0..=MAX_HOOK_MEMBERS)
+            .map(|index| MemberDiff {
+                key: format!("member-{index}"),
+                old: None,
+                new: Some(1),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            execute::member_changed(deps.as_mut(), hook.clone(), diffs).unwrap_err(),
+            ContractError::TooManyHookMembers {
+                count: MAX_HOOK_MEMBERS + 1,
+                max: MAX_HOOK_MEMBERS,
+            }
+        );
+
+        for count in [MAX_NFT_HOOK_TOKENS - 1, MAX_NFT_HOOK_TOKENS] {
+            let token_ids = (0..count)
+                .map(|index| format!("accepted-nft-{count}-{index}"))
+                .collect::<Vec<_>>();
+            execute::nft_stake_changed(
+                deps.as_mut(),
+                MessageInfo {
+                    sender: hook.clone(),
+                    funds: vec![],
+                },
+                NftStakeChangedHookMsg::Unstake {
+                    addr: Addr::unchecked("accepted-member"),
+                    token_ids,
+                },
+            )
+            .unwrap();
+        }
+
+        let token_ids = (0..=MAX_NFT_HOOK_TOKENS)
+            .map(|index| format!("nft-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            execute::nft_stake_changed(
+                deps.as_mut(),
+                MessageInfo {
+                    sender: hook,
+                    funds: vec![],
+                },
+                NftStakeChangedHookMsg::Unstake {
+                    addr: Addr::unchecked("member"),
+                    token_ids,
+                },
+            )
+            .unwrap_err(),
+            ContractError::TooManyNftHookTokens {
+                count: MAX_NFT_HOOK_TOKENS + 1,
+                max: MAX_NFT_HOOK_TOKENS,
+            }
+        );
+
+        assert!(GAUGES
+            .range(deps.as_ref().storage, None, None, Order::Ascending)
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn execution_rejects_overlong_adapter_message_list_without_advancing_epoch() {
+        let mut deps = mock_dependencies();
+        CONFIG
+            .save(
+                deps.as_mut().storage,
+                &Config {
+                    voting_powers: Addr::unchecked("voting"),
+                    hook_caller: Addr::unchecked("hook"),
+                    owner: Addr::unchecked("owner"),
+                    dao_core: Addr::unchecked("core"),
+                },
+            )
+            .unwrap();
+        GAUGES
+            .save(
+                deps.as_mut().storage,
+                7,
+                &Gauge {
+                    title: "bounded adapter".to_owned(),
+                    adapter: Addr::unchecked("adapter"),
+                    epoch: 600,
+                    min_percent_selected: None,
+                    max_options_selected: 10,
+                    max_available_percentage: None,
+                    is_stopped: false,
+                    next_epoch: 0,
+                    last_executed_set: None,
+                    reset: None,
+                },
+            )
+            .unwrap();
+        TALLY
+            .save(deps.as_mut().storage, (7, "alpha"), &100)
+            .unwrap();
+        OPTION_BY_POINTS
+            .save(deps.as_mut().storage, (7, 100, "alpha"), &1)
+            .unwrap();
+        TOTAL_CAST.save(deps.as_mut().storage, 7, &100).unwrap();
+
+        deps.querier.update_wasm(|query| match query {
+            WasmQuery::Smart { msg, .. } => {
+                let query: AdapterQueryMsg = from_json(msg).unwrap();
+                let response = match query {
+                    AdapterQueryMsg::CheckOption { .. } => {
+                        to_json_binary(&CheckOptionResponse { valid: true }).unwrap()
+                    }
+                    AdapterQueryMsg::SampleGaugeMsgs { .. } => {
+                        let message = CosmosMsg::Bank(BankMsg::Send {
+                            to_address: "recipient".to_owned(),
+                            amount: vec![],
+                        });
+                        to_json_binary(&SampleGaugeMsgsResponse {
+                            execute: vec![message; MAX_ADAPTER_MESSAGES],
+                        })
+                        .unwrap()
+                    }
+                    AdapterQueryMsg::AllOptions { .. } => unreachable!(),
+                };
+                SystemResult::Ok(ContractResult::Ok(response))
+            }
+            _ => unreachable!(),
+        });
+        let accepted =
+            execute::execute(deps.as_mut(), mock_env(), Addr::unchecked("keeper"), 7).unwrap();
+        assert!(accepted.attributes.iter().any(|attribute| {
+            attribute.key == "message_count" && attribute.value == MAX_ADAPTER_MESSAGES.to_string()
+        }));
+        GAUGES
+            .update(deps.as_mut().storage, 7, |gauge| -> StdResult<_> {
+                let mut gauge = gauge.unwrap();
+                gauge.next_epoch = 0;
+                Ok(gauge)
+            })
+            .unwrap();
+
+        deps.querier.update_wasm(|query| match query {
+            WasmQuery::Smart { msg, .. } => {
+                let query: AdapterQueryMsg = from_json(msg).unwrap();
+                let response = match query {
+                    AdapterQueryMsg::CheckOption { .. } => {
+                        to_json_binary(&CheckOptionResponse { valid: true }).unwrap()
+                    }
+                    AdapterQueryMsg::SampleGaugeMsgs { .. } => {
+                        let message = CosmosMsg::Bank(BankMsg::Send {
+                            to_address: "recipient".to_owned(),
+                            amount: vec![],
+                        });
+                        to_json_binary(&SampleGaugeMsgsResponse {
+                            execute: vec![message; MAX_ADAPTER_MESSAGES + 1],
+                        })
+                        .unwrap()
+                    }
+                    AdapterQueryMsg::AllOptions { .. } => unreachable!(),
+                };
+                SystemResult::Ok(ContractResult::Ok(response))
+            }
+            _ => unreachable!(),
+        });
+
+        let error =
+            execute::execute(deps.as_mut(), mock_env(), Addr::unchecked("keeper"), 7).unwrap_err();
+        assert_eq!(
+            error,
+            ContractError::TooManyAdapterMessages {
+                count: MAX_ADAPTER_MESSAGES + 1,
+                max: MAX_ADAPTER_MESSAGES,
+            }
+        );
+        assert_eq!(GAUGES.load(deps.as_ref().storage, 7).unwrap().next_epoch, 0);
+    }
+
+    #[test]
+    fn attachment_rejects_initial_epoch_overflow_before_allocating_state() {
+        let mut deps = mock_dependencies();
+
+        let error = execute::attach_gauge(
+            deps.as_mut(),
+            mock_env(),
+            GaugeConfig {
+                title: "overflow".to_owned(),
+                adapter: "adapter".to_owned(),
+                epoch_size: u64::MAX,
+                min_percent_selected: None,
+                max_options_selected: 1,
+                max_available_percentage: None,
+                reset_epoch: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ContractError::EpochScheduleOverflow {});
+        assert!(GAUGES
+            .range(deps.as_ref().storage, None, None, Order::Ascending)
+            .next()
+            .is_none());
+        assert_eq!(fetch_last_id(deps.as_mut().storage).unwrap(), 0);
+    }
+
+    #[test]
+    fn attachment_accepts_one_hundred_options_and_rejects_lookahead_101_atomically() {
+        let config = GaugeConfig {
+            title: "bounded import".to_owned(),
+            adapter: "adapter".to_owned(),
+            epoch_size: 600,
+            min_percent_selected: None,
+            max_options_selected: 10,
+            max_available_percentage: None,
+            reset_epoch: None,
+        };
+
+        let mut exact = mock_dependencies();
+        let exact_options = (0..MAX_OPTIONS_PER_GAUGE)
+            .map(|index| format!("option-{index:03}"))
+            .collect::<Vec<_>>();
+        exact.querier.update_wasm(move |query| match query {
+            WasmQuery::Smart { msg, .. } => {
+                let AdapterQueryMsg::AllOptions { start_after, limit } = from_json(msg).unwrap()
+                else {
+                    unreachable!()
+                };
+                let start = start_after
+                    .and_then(|cursor| {
+                        exact_options
+                            .iter()
+                            .position(|option| option == &cursor)
+                            .map(|index| index + 1)
+                    })
+                    .unwrap_or_default();
+                let options = exact_options
+                    .iter()
+                    .skip(start)
+                    .take(limit.unwrap_or(30) as usize)
+                    .cloned()
+                    .collect();
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&AllOptionsResponse { options }).unwrap(),
+                ))
+            }
+            _ => unreachable!(),
+        });
+        let (gauge_id, _) =
+            execute::attach_gauge(exact.as_mut(), mock_env(), config.clone()).unwrap();
+        let health = query::gauge_health(exact.as_ref(), gauge_id).unwrap();
+        assert_eq!(health.option_count, MAX_OPTIONS_PER_GAUGE as u32);
+        assert_eq!(health.indexed_option_count, MAX_OPTIONS_PER_GAUGE as u32);
+        assert!(health.scan_complete);
+        assert!(health.consistent);
+
+        let mut over = mock_dependencies();
+        let over_options = (0..=MAX_OPTIONS_PER_GAUGE)
+            .map(|index| format!("option-{index:03}"))
+            .collect::<Vec<_>>();
+        over.querier.update_wasm(move |query| match query {
+            WasmQuery::Smart { msg, .. } => {
+                let AdapterQueryMsg::AllOptions { start_after, limit } = from_json(msg).unwrap()
+                else {
+                    unreachable!()
+                };
+                let start = start_after
+                    .and_then(|cursor| {
+                        over_options
+                            .iter()
+                            .position(|option| option == &cursor)
+                            .map(|index| index + 1)
+                    })
+                    .unwrap_or_default();
+                let options = over_options
+                    .iter()
+                    .skip(start)
+                    .take(limit.unwrap_or(30) as usize)
+                    .cloned()
+                    .collect();
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&AllOptionsResponse { options }).unwrap(),
+                ))
+            }
+            _ => unreachable!(),
+        });
+        let error = execute::attach_gauge(over.as_mut(), mock_env(), config).unwrap_err();
+        assert_eq!(
+            error,
+            ContractError::TooManyOptions {
+                count: MAX_OPTIONS_PER_GAUGE + 1,
+                max: MAX_OPTIONS_PER_GAUGE,
+            }
+        );
+        assert!(GAUGES
+            .range(over.as_ref().storage, None, None, Order::Ascending)
+            .next()
+            .is_none());
+        assert_eq!(fetch_last_id(over.as_mut().storage).unwrap(), 0);
+    }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -64,6 +839,7 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
+    nonpayable(&info)?;
     match msg {
         ExecuteMsg::StakeChangeHook(msg) => execute::stake_changed(deps, info, msg),
         ExecuteMsg::NftStakeChangeHook(msg) => execute::nft_stake_changed(deps, info, msg),
@@ -87,8 +863,9 @@ pub fn execute(
             max_available_percentage,
         ),
         ExecuteMsg::StopGauge { gauge } => execute::stop_gauge(deps, info.sender, gauge),
+        ExecuteMsg::ResumeGauge { gauge } => execute::resume_gauge(deps, info.sender, gauge),
         ExecuteMsg::ResetGauge { gauge, batch_size } => {
-            execute::reset_gauge(deps, env, gauge, batch_size)
+            execute::reset_gauge(deps, env, info.sender, gauge, batch_size)
         }
         ExecuteMsg::AddOption { gauge, option } => {
             execute::add_option(deps, info.sender, gauge, option)
@@ -99,7 +876,7 @@ pub fn execute(
         ExecuteMsg::PlaceVotes { gauge, votes } => {
             execute::place_votes(deps, env, info.sender, gauge, votes)
         }
-        ExecuteMsg::Execute { gauge } => execute::execute(deps, env, gauge),
+        ExecuteMsg::Execute { gauge } => execute::execute(deps, env, info.sender, gauge),
         ExecuteMsg::AddHook { addr } => execute::add_hook(deps, info.sender, addr),
         ExecuteMsg::RemoveHook { addr } => execute::remove_hook(deps, info.sender, addr),
     }
@@ -110,7 +887,7 @@ mod execute {
     use dao_hooks::{nft_stake::NftStakeChangedHookMsg, stake::StakeChangedHookMsg};
 
     use super::*;
-    use crate::state::{remove_tally, update_tallies, Reset, Vote};
+    use crate::state::{update_tallies, Reset, Vote};
     use std::collections::HashMap;
 
     pub fn member_changed(
@@ -122,8 +899,19 @@ mod execute {
         if sender != CONFIG.load(deps.storage)?.hook_caller {
             return Err(ContractError::Unauthorized {});
         }
+        if diffs.len() > MAX_HOOK_MEMBERS {
+            return Err(ContractError::TooManyHookMembers {
+                count: diffs.len(),
+                max: MAX_HOOK_MEMBERS,
+            });
+        }
 
-        let mut response = Response::new().add_attribute("action", "member_changed_hook");
+        let member_count = diffs.len();
+        let mut updated_votes = 0usize;
+        let mut response = Response::new()
+            .add_attribute("action", "member_changed_hook")
+            .add_attribute("hook_caller", &sender)
+            .add_attribute("member_count", member_count.to_string());
         let mut gauges = HashMap::new();
 
         for diff in diffs {
@@ -132,9 +920,7 @@ mod execute {
 
             // for each gauge this user voted on,
             // update the tallies and update the users vote power
-            for mut vote in
-                votes().query_votes_by_voter(deps.as_ref(), &voter, None, Some(query::MAX_LIMIT))?
-            {
+            for mut vote in votes().power_change_votes(deps.as_ref(), &voter)? {
                 // find change of vote powers
                 let old = Uint128::new(diff.old.unwrap_or_default().into());
                 let new = Uint128::new(diff.new.unwrap_or_default().into());
@@ -170,10 +956,11 @@ mod execute {
                 // store new vote power for this user
                 vote.power = new;
                 votes().save(deps.storage, &voter, vote.gauge_id, &vote)?;
+                updated_votes += 1;
             }
         }
 
-        Ok(response)
+        Ok(response.add_attribute("updated_votes", updated_votes.to_string()))
     }
 
     pub fn stake_changed(
@@ -188,20 +975,20 @@ mod execute {
 
         match msg {
             StakeChangedHookMsg::Stake { addr, amount } => {
+                let mut updated_votes = 0usize;
                 // for each gauge this user voted on,
                 // update the tallies and update the users vote power
-                for mut vote in votes().query_votes_by_voter(
-                    deps.as_ref(),
-                    &addr,
-                    None,
-                    Some(query::MAX_LIMIT),
-                )? {
+                for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
                     let old = vote.power;
 
                     // Voting power increases with staking amount
-                    let new = vote.power + amount;
+                    let new = vote.power.checked_add(amount).map_err(|_| {
+                        ContractError::VotingPowerOverflow {
+                            voter: addr.to_string(),
+                        }
+                    })?;
 
                     if vote.is_expired(&gauge) {
                         continue;
@@ -224,25 +1011,32 @@ mod execute {
                     // Update and store new vote power for this user
                     vote.power = new;
                     votes().save(deps.storage, &addr, vote.gauge_id, &vote)?;
+                    updated_votes += 1;
                 }
 
-                Ok(Response::new())
+                Ok(Response::new()
+                    .add_attribute("action", "stake_change_hook")
+                    .add_attribute("hook_caller", &info.sender)
+                    .add_attribute("kind", "stake")
+                    .add_attribute("voter", &addr)
+                    .add_attribute("amount", amount)
+                    .add_attribute("updated_votes", updated_votes.to_string()))
             }
             StakeChangedHookMsg::Unstake { addr, amount } => {
+                let mut updated_votes = 0usize;
                 // for each gauge this user voted on,
                 // update the tallies and update the users vote power
-                for mut vote in votes().query_votes_by_voter(
-                    deps.as_ref(),
-                    &addr,
-                    None,
-                    Some(query::MAX_LIMIT),
-                )? {
+                for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
                     let old = vote.power;
 
                     // Decrease voting power by unstaked amount
-                    let new = vote.power - amount;
+                    let new = vote.power.checked_sub(amount).map_err(|_| {
+                        ContractError::VotingPowerUnderflow {
+                            voter: addr.to_string(),
+                        }
+                    })?;
 
                     if vote.is_expired(&gauge) {
                         continue;
@@ -265,9 +1059,16 @@ mod execute {
                     // Update and store new vote power for this user
                     vote.power = new;
                     votes().save(deps.storage, &addr, vote.gauge_id, &vote)?;
+                    updated_votes += 1;
                 }
 
-                Ok(Response::new())
+                Ok(Response::new()
+                    .add_attribute("action", "stake_change_hook")
+                    .add_attribute("hook_caller", &info.sender)
+                    .add_attribute("kind", "unstake")
+                    .add_attribute("voter", &addr)
+                    .add_attribute("amount", amount)
+                    .add_attribute("updated_votes", updated_votes.to_string()))
             }
         }
     }
@@ -283,20 +1084,20 @@ mod execute {
         }
 
         match msg {
-            NftStakeChangedHookMsg::Stake { addr, token_id: _ } => {
+            NftStakeChangedHookMsg::Stake { addr, token_id } => {
+                let mut updated_votes = 0usize;
                 // for each gauge this user voted on,
                 // update the tallies and update the users vote power
-                for mut vote in votes().query_votes_by_voter(
-                    deps.as_ref(),
-                    &addr,
-                    None,
-                    Some(query::MAX_LIMIT),
-                )? {
+                for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
                     let old = vote.power;
                     // Voting power increases by one (only one token_id staked at a time)
-                    let new = vote.power + Uint128::one();
+                    let new = vote.power.checked_add(Uint128::one()).map_err(|_| {
+                        ContractError::VotingPowerOverflow {
+                            voter: addr.to_string(),
+                        }
+                    })?;
 
                     if vote.is_expired(&gauge) {
                         continue;
@@ -319,19 +1120,30 @@ mod execute {
                     // Update and store new vote power for this user
                     vote.power = new;
                     votes().save(deps.storage, &addr, vote.gauge_id, &vote)?;
+                    updated_votes += 1;
                 }
 
-                Ok(Response::new())
+                Ok(Response::new()
+                    .add_attribute("action", "nft_stake_change_hook")
+                    .add_attribute("hook_caller", &info.sender)
+                    .add_attribute("kind", "stake")
+                    .add_attribute("voter", &addr)
+                    .add_attribute("token_id", token_id)
+                    .add_attribute("token_count", "1")
+                    .add_attribute("updated_votes", updated_votes.to_string()))
             }
             NftStakeChangedHookMsg::Unstake { addr, token_ids } => {
+                if token_ids.len() > MAX_NFT_HOOK_TOKENS {
+                    return Err(ContractError::TooManyNftHookTokens {
+                        count: token_ids.len(),
+                        max: MAX_NFT_HOOK_TOKENS,
+                    });
+                }
+                let token_count = token_ids.len();
+                let mut updated_votes = 0usize;
                 // for each gauge this user voted on,
                 // update the tallies and update the users vote power
-                for mut vote in votes().query_votes_by_voter(
-                    deps.as_ref(),
-                    &addr,
-                    None,
-                    Some(query::MAX_LIMIT),
-                )? {
+                for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
                     let old = vote.power;
@@ -339,7 +1151,11 @@ mod execute {
                     // Decrease voting power by number of token_ids.
                     // `usize` is always representable in u128.
                     let amount = token_ids.len() as u128;
-                    let new = vote.power - Uint128::new(amount);
+                    let new = vote.power.checked_sub(Uint128::new(amount)).map_err(|_| {
+                        ContractError::VotingPowerUnderflow {
+                            voter: addr.to_string(),
+                        }
+                    })?;
 
                     if vote.is_expired(&gauge) {
                         continue;
@@ -362,9 +1178,16 @@ mod execute {
                     // Update and store new vote power for this user
                     vote.power = new;
                     votes().save(deps.storage, &addr, vote.gauge_id, &vote)?;
+                    updated_votes += 1;
                 }
 
-                Ok(Response::new())
+                Ok(Response::new()
+                    .add_attribute("action", "nft_stake_change_hook")
+                    .add_attribute("hook_caller", &info.sender)
+                    .add_attribute("kind", "unstake")
+                    .add_attribute("voter", &addr)
+                    .add_attribute("token_count", token_count.to_string())
+                    .add_attribute("updated_votes", updated_votes.to_string()))
             }
         }
     }
@@ -380,11 +1203,14 @@ mod execute {
             return Err(ContractError::Unauthorized {});
         }
 
-        let adapter = attach_gauge(deps, env, options)?;
+        let (gauge_id, adapter) = attach_gauge(deps, env, options)?;
 
         Ok(Response::new()
             .add_attribute("action", "create_gauge")
-            .add_attribute("adapter", adapter))
+            .add_attribute("sender", &sender)
+            .add_attribute("adapter", adapter)
+            .add_attribute("gauge_id", gauge_id.to_string())
+            .set_data(to_json_binary(&CreateGaugeReply { id: gauge_id })?))
     }
 
     pub fn attach_gauge(
@@ -399,10 +1225,19 @@ mod execute {
             max_available_percentage,
             reset_epoch,
         }: GaugeConfig,
-    ) -> Result<Addr, ContractError> {
+    ) -> Result<(GaugeId, Addr), ContractError> {
         let adapter = deps.api.addr_validate(&adapter)?;
+        if title.len() > MAX_TITLE_BYTES {
+            return Err(ContractError::StringTooLong {
+                field: "title".to_owned(),
+                max: MAX_TITLE_BYTES,
+            });
+        }
         // gauge parameter validation
         ensure!(epoch_size > 60u64, ContractError::EpochSizeTooShort {});
+        if reset_epoch == Some(0) {
+            return Err(ContractError::InvalidResetInterval {});
+        }
         if let Some(min_percent_selected) = min_percent_selected {
             ensure!(
                 min_percent_selected < Decimal::one(),
@@ -429,28 +1264,71 @@ mod execute {
             max_options_selected,
             max_available_percentage,
             is_stopped: false,
-            next_epoch: env.block.time.seconds() + epoch_size,
+            next_epoch: env
+                .block
+                .time
+                .seconds()
+                .checked_add(epoch_size)
+                .ok_or(ContractError::EpochScheduleOverflow {})?,
             last_executed_set: None,
-            reset: reset_epoch.map(|r| Reset {
-                last: None,
-                reset_each: r,
-                next: env.block.time.plus_seconds(r).seconds(),
-            }),
+            reset: reset_epoch
+                .map(|r| {
+                    Ok::<Reset, ContractError>(Reset {
+                        last: None,
+                        reset_each: r,
+                        next: env
+                            .block
+                            .time
+                            .seconds()
+                            .checked_add(r)
+                            .ok_or(ContractError::ResetScheduleOverflow {})?,
+                    })
+                })
+                .transpose()?,
         };
-        let last_id: GaugeId = fetch_last_id(deps.storage)?;
-        GAUGES.save(deps.storage, last_id, &gauge)?;
-
         // Fetch adapter options and bulk-register them. The adapter is the
         // source of truth for what options exist; no per-option validation
-        // or voting-power check applies here.
+        // or voting-power check applies here. Complete all external reads and
+        // validation before allocating an ID or writing partial gauge state.
         let adapter_options: AllOptionsResponse =
             deps.querier.query(&QueryRequest::Wasm(WasmQuery::Smart {
                 contract_addr: adapter.to_string(),
-                msg: to_json_binary(&AdapterQueryMsg::AllOptions {})?,
+                msg: to_json_binary(&AdapterQueryMsg::AllOptions {
+                    start_after: None,
+                    limit: Some(MAX_OPTIONS_PER_GAUGE as u32),
+                })?,
             }))?;
+        if adapter_options.options.len() > MAX_OPTIONS_PER_GAUGE {
+            return Err(ContractError::TooManyOptions {
+                count: adapter_options.options.len(),
+                max: MAX_OPTIONS_PER_GAUGE,
+            });
+        }
+        if adapter_options.options.len() == MAX_OPTIONS_PER_GAUGE {
+            let lookahead: AllOptionsResponse =
+                deps.querier.query(&QueryRequest::Wasm(WasmQuery::Smart {
+                    contract_addr: adapter.to_string(),
+                    msg: to_json_binary(&AdapterQueryMsg::AllOptions {
+                        start_after: adapter_options.options.last().cloned(),
+                        limit: Some(1),
+                    })?,
+                }))?;
+            if !lookahead.options.is_empty() {
+                return Err(ContractError::TooManyOptions {
+                    count: MAX_OPTIONS_PER_GAUGE + 1,
+                    max: MAX_OPTIONS_PER_GAUGE,
+                });
+            }
+        }
+
+        let last_id: GaugeId = fetch_last_id(deps.storage)?;
+        if last_id >= MAX_GAUGES {
+            return Err(ContractError::TooManyGauges { max: MAX_GAUGES });
+        }
+        GAUGES.save(deps.storage, last_id, &gauge)?;
         execute::add_adapter_options(deps.branch(), last_id, adapter_options.options)?;
 
-        Ok(adapter)
+        Ok((last_id, adapter))
     }
 
     pub fn update_gauge(
@@ -503,7 +1381,27 @@ mod execute {
         }
         GAUGES.save(deps.storage, gauge_id, &gauge)?;
 
-        Ok(Response::new().add_attribute("action", "update_gauge"))
+        Ok(Response::new()
+            .add_attribute("action", "update_gauge")
+            .add_attribute("sender", &sender)
+            .add_attribute("gauge_id", gauge_id.to_string())
+            .add_attribute("epoch_size", gauge.epoch.to_string())
+            .add_attribute(
+                "min_percent_selected",
+                gauge
+                    .min_percent_selected
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            )
+            .add_attribute(
+                "max_options_selected",
+                gauge.max_options_selected.to_string(),
+            )
+            .add_attribute(
+                "max_available_percentage",
+                gauge
+                    .max_available_percentage
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            ))
     }
 
     pub fn stop_gauge(
@@ -525,6 +1423,27 @@ mod execute {
 
         Ok(Response::new()
             .add_attribute("action", "stop_gauge")
+            .add_attribute("sender", &sender)
+            .add_attribute("gauge_id", gauge_id.to_string()))
+    }
+
+    pub fn resume_gauge(
+        deps: DepsMut,
+        sender: Addr,
+        gauge_id: GaugeId,
+    ) -> Result<Response, ContractError> {
+        let config = CONFIG.load(deps.storage)?;
+        if sender != config.owner {
+            return Err(ContractError::Unauthorized {});
+        }
+
+        let mut gauge = GAUGES.load(deps.storage, gauge_id)?;
+        gauge.is_stopped = false;
+        GAUGES.save(deps.storage, gauge_id, &gauge)?;
+
+        Ok(Response::new()
+            .add_attribute("action", "resume_gauge")
+            .add_attribute("sender", &sender)
             .add_attribute("gauge_id", gauge_id.to_string()))
     }
 
@@ -544,7 +1463,13 @@ mod execute {
             return Err(ContractError::Unauthorized {});
         }
 
-        remove_tally(deps.storage, gauge_id, &option)?;
+        let points = TALLY.load(deps.storage, (gauge_id, &option))?;
+        OPTION_BY_POINTS.remove(deps.storage, (gauge_id, points, &option));
+        if points == 0 {
+            TALLY.remove(deps.storage, (gauge_id, &option));
+        } else {
+            INVALID_OPTIONS.save(deps.storage, (gauge_id, &option), &true)?;
+        }
 
         Ok(Response::new()
             .add_attribute("action", "remove_option")
@@ -556,46 +1481,99 @@ mod execute {
     pub fn reset_gauge(
         deps: DepsMut,
         env: Env,
+        sender: Addr,
         gauge_id: GaugeId,
         batch_size: u32,
     ) -> Result<Response, ContractError> {
-        let mut gauge = GAUGES.load(deps.storage, gauge_id)?;
-        match gauge.reset {
-            Some(ref mut reset) if reset.next <= env.block.time.seconds() => {
-                reset.last = Some(reset.next);
-
-                // remove all options from the gauge
-                let keys = OPTION_BY_POINTS
-                    .sub_prefix(gauge_id)
-                    .keys(deps.storage, None, None, Order::Ascending)
-                    .take(batch_size as usize)
-                    .collect::<StdResult<Vec<_>>>()?;
-                for (points, option) in &keys {
-                    OPTION_BY_POINTS.remove(deps.storage, (gauge_id, *points, option));
-                    OPTION_BY_POINTS.save(deps.storage, (gauge_id, 0, option), &1)?;
-                    TALLY.save(deps.storage, (gauge_id, option), &0)?;
-                }
-
-                // if this is the last batch, update the reset epoch
-                if (keys.len() as u32) < batch_size {
-                    // removing total cast only once at the end to save gas
-                    TOTAL_CAST.save(deps.storage, gauge_id, &0)?;
-                    reset.next += reset.reset_each;
-                }
-            }
-            Some(_) => {
-                return Err(ContractError::ResetEpochNotPassed {});
-            }
-            None => {
-                return Err(ContractError::Unauthorized {});
-            }
+        const MAX_RESET_BATCH_SIZE: u32 = 100;
+        if batch_size == 0 || batch_size > MAX_RESET_BATCH_SIZE {
+            return Err(ContractError::InvalidResetBatchSize {
+                size: batch_size,
+                max: MAX_RESET_BATCH_SIZE,
+            });
         }
 
-        GAUGES.save(deps.storage, gauge_id, &gauge)?;
+        let mut gauge = GAUGES.load(deps.storage, gauge_id)?;
+        if gauge.is_stopped {
+            return Err(ContractError::GaugeStopped(gauge_id));
+        }
+        match gauge.reset {
+            Some(ref mut reset) if reset.next <= env.block.time.seconds() => {
+                if reset.reset_each == 0 {
+                    return Err(ContractError::InvalidResetInterval {});
+                }
+                let starting = reset.last != Some(reset.next);
+                if starting {
+                    reset.last = Some(reset.next);
+                    RESET_CURSOR.remove(deps.storage, gauge_id);
+                }
 
-        Ok(Response::new()
-            .add_attribute("action", "reset_gauge")
-            .add_attribute("gauge_id", gauge_id.to_string()))
+                // Scan the primary option namespace in stable lexical order.
+                // Read one lookahead key so a batch that exactly consumes the
+                // remaining work can complete without an extra keeper call.
+                let cursor = RESET_CURSOR.may_load(deps.storage, gauge_id)?;
+                let start = cursor.as_deref().map(Bound::exclusive);
+                let options = TALLY
+                    .prefix(gauge_id)
+                    .keys(deps.storage, start, None, Order::Ascending)
+                    .take(batch_size as usize + 1)
+                    .collect::<StdResult<Vec<_>>>()?;
+                let processed = options.len().min(batch_size as usize);
+                for option in options.iter().take(processed) {
+                    let points = TALLY.load(deps.storage, (gauge_id, option))?;
+                    OPTION_BY_POINTS.remove(deps.storage, (gauge_id, points, option));
+                    if INVALID_OPTIONS.has(deps.storage, (gauge_id, option)) {
+                        TALLY.remove(deps.storage, (gauge_id, option));
+                        INVALID_OPTIONS.remove(deps.storage, (gauge_id, option));
+                    } else {
+                        OPTION_BY_POINTS.save(deps.storage, (gauge_id, 0, option), &1)?;
+                        TALLY.save(deps.storage, (gauge_id, option), &0)?;
+                    }
+                }
+
+                let complete = options.len() <= batch_size as usize;
+                if complete {
+                    TOTAL_CAST.save(deps.storage, gauge_id, &0)?;
+                    RESET_CURSOR.remove(deps.storage, gauge_id);
+
+                    // Catch up from the prior deadline to the first deadline
+                    // strictly after the current block, avoiding reset storms
+                    // after long downtime while preserving schedule cadence.
+                    let elapsed = env
+                        .block
+                        .time
+                        .seconds()
+                        .checked_sub(reset.next)
+                        .ok_or(ContractError::ResetScheduleOverflow {})?;
+                    let intervals = elapsed
+                        .checked_div(reset.reset_each)
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(ContractError::ResetScheduleOverflow {})?;
+                    let advance = reset
+                        .reset_each
+                        .checked_mul(intervals)
+                        .ok_or(ContractError::ResetScheduleOverflow {})?;
+                    reset.next = reset
+                        .next
+                        .checked_add(advance)
+                        .ok_or(ContractError::ResetScheduleOverflow {})?;
+                } else if let Some(last) = options.get(processed.saturating_sub(1)) {
+                    RESET_CURSOR.save(deps.storage, gauge_id, last)?;
+                }
+
+                let next_reset = reset.next;
+                GAUGES.save(deps.storage, gauge_id, &gauge)?;
+                Ok(Response::new()
+                    .add_attribute("action", "reset_gauge")
+                    .add_attribute("sender", &sender)
+                    .add_attribute("gauge_id", gauge_id.to_string())
+                    .add_attribute("processed", processed.to_string())
+                    .add_attribute("complete", complete.to_string())
+                    .add_attribute("next_reset", next_reset.to_string()))
+            }
+            Some(_) => Err(ContractError::ResetEpochNotPassed {}),
+            None => Err(ContractError::Unauthorized {}),
+        }
     }
 
     /// Handler for `ExecuteMsg::AddOption`. Validates the option against the
@@ -608,6 +1586,24 @@ mod execute {
         gauge_id: GaugeId,
         option: String,
     ) -> Result<Response, ContractError> {
+        if option.len() > MAX_OPTION_BYTES {
+            return Err(ContractError::StringTooLong {
+                field: "option".to_owned(),
+                max: MAX_OPTION_BYTES,
+            });
+        }
+        let option_count = TALLY
+            .prefix(gauge_id)
+            .keys(deps.storage, None, None, Order::Ascending)
+            .take(MAX_OPTIONS_PER_GAUGE + 1)
+            .collect::<StdResult<Vec<_>>>()?
+            .len();
+        if option_count >= MAX_OPTIONS_PER_GAUGE {
+            return Err(ContractError::TooManyOptions {
+                count: option_count + 1,
+                max: MAX_OPTIONS_PER_GAUGE,
+            });
+        }
         if TALLY.has(deps.as_ref().storage, (gauge_id, &option)) {
             return Err(ContractError::OptionAlreadyExists { option, gauge_id });
         };
@@ -662,6 +1658,12 @@ mod execute {
         options: Vec<String>,
     ) -> Result<(), ContractError> {
         for option in options {
+            if option.is_empty() || option.len() > MAX_OPTION_BYTES {
+                return Err(ContractError::StringTooLong {
+                    field: "option".to_owned(),
+                    max: MAX_OPTION_BYTES,
+                });
+            }
             if TALLY.has(deps.as_ref().storage, (gauge_id, &option)) {
                 return Err(ContractError::OptionAlreadyExists { option, gauge_id });
             }
@@ -680,7 +1682,7 @@ mod execute {
     }
 
     pub fn place_votes(
-        deps: DepsMut,
+        mut deps: DepsMut,
         env: Env,
         sender: Addr,
         gauge_id: GaugeId,
@@ -691,15 +1693,58 @@ mod execute {
             None => return Err(ContractError::GaugeMissing(gauge_id)),
         };
 
+        if gauge.is_stopped {
+            return Err(ContractError::GaugeStopped(gauge_id));
+        }
+
         if gauge.is_resetting() {
             return Err(ContractError::GaugeResetting(gauge_id));
         }
 
-        // make sure sums work out
+        // Validate the complete payload before querying power or touching tally
+        // state. Partial allocation is intentional: unallocated weight is not
+        // counted and is never redistributed by vote accounting.
         let new_votes = new_votes.unwrap_or_default();
-        let total_weight = new_votes.iter().map(|v| v.weight).sum();
-        if total_weight > Decimal::one() {
-            return Err(ContractError::TooMuchVotingWeight(total_weight));
+        const MAX_VOTES_PER_GAUGE: usize = 100;
+        if new_votes.len() > MAX_VOTES_PER_GAUGE {
+            return Err(ContractError::TooManyVoteEntries {
+                count: new_votes.len(),
+                max: MAX_VOTES_PER_GAUGE,
+            });
+        }
+        let mut seen = std::collections::HashSet::with_capacity(new_votes.len());
+        for vote in &new_votes {
+            if vote.option.is_empty() {
+                return Err(ContractError::EmptyVoteOption {});
+            }
+            if vote.option.len() > MAX_OPTION_BYTES {
+                return Err(ContractError::StringTooLong {
+                    field: "option".to_owned(),
+                    max: MAX_OPTION_BYTES,
+                });
+            }
+            if vote.weight.is_zero() {
+                return Err(ContractError::ZeroVoteWeight {
+                    option: vote.option.clone(),
+                });
+            }
+            if !seen.insert(vote.option.as_str()) {
+                return Err(ContractError::DuplicateVoteOption {
+                    option: vote.option.clone(),
+                });
+            }
+        }
+        let mut total_weight = Decimal::zero();
+        for vote in &new_votes {
+            total_weight = total_weight
+                .checked_add(vote.weight)
+                .map_err(|_| ContractError::VoteWeightOverflow {})?;
+            // Check incrementally. Besides failing earlier, this prevents a
+            // vector of enormous Decimal values from overflowing inside an
+            // unchecked iterator sum before reaching the >100% validation.
+            if total_weight > Decimal::one() {
+                return Err(ContractError::TooMuchVotingWeight(total_weight));
+            }
         }
 
         // load voter power from voting powers contract (DAO)
@@ -740,6 +1785,18 @@ mod execute {
         if previous_vote.is_none() && new_votes.is_empty() {
             return Err(ContractError::CannotRemoveNonexistingVote {});
         }
+        if previous_vote.is_none() {
+            let existing = votes().power_change_votes(deps.as_ref(), &sender)?;
+            if existing.len() >= MAX_GAUGE_VOTES_PER_VOTER {
+                return Err(ContractError::TooManyGaugeVotes {
+                    // power_change_votes returns at most the enforced maximum;
+                    // this branch represents the one additional attempted
+                    // record, so the reported count is deterministic.
+                    count: MAX_GAUGE_VOTES_PER_VOTER.saturating_add(1),
+                    max: MAX_GAUGE_VOTES_PER_VOTER,
+                });
+            }
+        }
 
         // first, calculate a diff between new_vote and previous_vote (option -> (old, new))
         let previous_vote = previous_vote.unwrap_or_default();
@@ -758,14 +1815,12 @@ mod execute {
             diff.insert(&v.option, add);
         }
 
-        // second, test any new options are valid,
-        // only for those voted for first time (others have already been checked)
-        for new_opt in diff
-            .iter()
-            .filter(|(_, (old, _))| *old == 0)
-            .map(|(&k, _)| k)
-        {
-            if !TALLY.has(deps.storage, (gauge_id, new_opt)) {
+        // Every option in the replacement must still be active. An option may
+        // have been tombstoned since this voter last submitted it.
+        for new_opt in new_votes.iter().map(|vote| vote.option.as_str()) {
+            if !TALLY.has(deps.storage, (gauge_id, new_opt))
+                || INVALID_OPTIONS.has(deps.storage, (gauge_id, new_opt))
+            {
                 return Err(ContractError::OptionDoesNotExists {
                     option: new_opt.to_string(),
                     gauge_id,
@@ -802,9 +1857,10 @@ mod execute {
             .may_load(deps.storage, &sender, gauge_id)?
             .map(|v| v.votes)
             .unwrap_or_default();
+        let option_count = snapshot_votes.len();
         let hook_msgs = new_vote_hook_msgs(
             VOTE_HOOKS,
-            deps.storage,
+            deps.branch(),
             gauge_id,
             sender.clone(),
             snapshot_votes,
@@ -816,6 +1872,8 @@ mod execute {
             .add_attribute("action", "place_vote")
             .add_attribute("sender", &sender)
             .add_attribute("gauge_id", gauge_id.to_string())
+            .add_attribute("option_count", option_count.to_string())
+            .add_attribute("voting_power", voting_power)
             .add_submessages(hook_msgs);
         Ok(response)
     }
@@ -824,10 +1882,16 @@ mod execute {
         if sender != CONFIG.load(deps.storage)?.owner {
             return Err(ContractError::Unauthorized {});
         }
+        if VOTE_HOOKS.hook_count(deps.storage)? >= MAX_VOTE_HOOKS {
+            return Err(ContractError::TooManyHooks {
+                max: MAX_VOTE_HOOKS,
+            });
+        }
         let hook = deps.api.addr_validate(&addr)?;
         VOTE_HOOKS.add_hook(deps.storage, hook)?;
         Ok(Response::new()
             .add_attribute("action", "add_hook")
+            .add_attribute("sender", &sender)
             .add_attribute("hook", addr))
     }
 
@@ -843,10 +1907,16 @@ mod execute {
         VOTE_HOOKS.remove_hook(deps.storage, hook)?;
         Ok(Response::new()
             .add_attribute("action", "remove_hook")
+            .add_attribute("sender", &sender)
             .add_attribute("hook", addr))
     }
 
-    pub fn execute(deps: DepsMut, env: Env, gauge_id: u64) -> Result<Response, ContractError> {
+    pub fn execute(
+        deps: DepsMut,
+        env: Env,
+        sender: Addr,
+        gauge_id: u64,
+    ) -> Result<Response, ContractError> {
         let mut gauge = GAUGES.load(deps.storage, gauge_id)?;
 
         if gauge.is_stopped {
@@ -864,30 +1934,49 @@ mod execute {
                 next_epoch: gauge.next_epoch,
             });
         }
-        gauge.next_epoch = env.block.time.plus_seconds(gauge.epoch).seconds();
+        gauge.next_epoch = current_epoch
+            .checked_add(gauge.epoch)
+            .ok_or(ContractError::EpochScheduleOverflow {})?;
 
         // this set contains tuple (option, total_voted_power)
         // for adapter query, this needs to be transformed into (option, voted_weight)
         let selected_set_with_powers = query::selected_set(deps.as_ref(), gauge_id)?.votes;
-        let selected_powers_sum = selected_set_with_powers
-            .iter()
-            .map(|(_, power)| power.u128())
-            .sum::<u128>();
+        let total_cast = TOTAL_CAST.load(deps.storage, gauge_id)?;
 
         // save the selected options and their powers for the frontend to display
         gauge.last_executed_set = Some(selected_set_with_powers.clone());
 
-        // calculate "local" ratios of voted options per total power of all selected options
+        if selected_set_with_powers.is_empty() {
+            GAUGES.save(deps.storage, gauge_id, &gauge)?;
+            return Ok(Response::new()
+                .add_attribute("action", "execute_tally")
+                .add_attribute("sender", &sender)
+                .add_attribute("gauge_id", gauge_id.to_string())
+                .add_attribute("next_epoch", gauge.next_epoch.to_string())
+                .add_attribute("selected_count", "0")
+                .add_attribute("message_count", "0"));
+        }
+
+        // Preserve global allocation shares. Capped or unselected power is
+        // intentionally unallocated; selected entries are not renormalized.
         let selected = selected_set_with_powers
             .into_iter()
-            .map(|(option, power)| Ok((option, Decimal::from_ratio(power, selected_powers_sum))))
-            .collect::<StdResult<Vec<(String, Decimal)>>>()?;
+            .map(|(option, power)| (option, Decimal::from_ratio(power, total_cast)))
+            .collect::<Vec<(String, Decimal)>>();
+        let selected_count = selected.len();
 
         // query gauge adapter for execute messages for DAO
         let execute_messages: SampleGaugeMsgsResponse = deps.querier.query_wasm_smart(
             gauge.adapter.clone(),
             &AdapterQueryMsg::SampleGaugeMsgs { selected },
         )?;
+        if execute_messages.execute.len() > MAX_ADAPTER_MESSAGES {
+            return Err(ContractError::TooManyAdapterMessages {
+                count: execute_messages.execute.len(),
+                max: MAX_ADAPTER_MESSAGES,
+            });
+        }
+        let message_count = execute_messages.execute.len();
 
         let config = CONFIG.load(deps.storage)?;
         let execute_msg = WasmMsg::Execute {
@@ -902,6 +1991,11 @@ mod execute {
 
         Ok(Response::new()
             .add_attribute("action", "execute_tally")
+            .add_attribute("sender", &sender)
+            .add_attribute("gauge_id", gauge_id.to_string())
+            .add_attribute("next_epoch", gauge.next_epoch.to_string())
+            .add_attribute("selected_count", selected_count.to_string())
+            .add_attribute("message_count", message_count.to_string())
             .add_message(execute_msg))
     }
 }
@@ -909,6 +2003,7 @@ mod execute {
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
+        QueryMsg::Config {} => Ok(to_json_binary(&query::config(deps)?)?),
         QueryMsg::Info {} => Ok(to_json_binary(&query::info(deps)?)?),
         QueryMsg::Gauge { id } => Ok(to_json_binary(&query::gauge(deps, id)?)?),
         QueryMsg::ListGauges { start_after, limit } => Ok(to_json_binary(&query::list_gauges(
@@ -941,34 +2036,55 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::LastExecutedSet { gauge } => {
             Ok(to_json_binary(&query::last_executed_set(deps, gauge)?)?)
         }
+        QueryMsg::GaugeHealth { gauge } => Ok(to_json_binary(&query::gauge_health(deps, gauge)?)?),
         QueryMsg::GetHooks {} => Ok(to_json_binary(&GetHooksResponse {
             hooks: VOTE_HOOKS.query_hooks(deps)?.hooks,
         })?),
     }
 }
 
-/// Auto-unregisters a vote hook subscriber that errored on its
-/// `GaugeVoteHook` call. The reply ID is the hook's index at firing time;
-/// `remove_hook_by_index` drops it so future `PlaceVotes` calls don't keep
-/// paying the failing subscriber's gas.
+/// Cleans up a stable vote-hook reply association and auto-unregisters only
+/// the subscriber whose call failed.
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response, ContractError> {
-    let removed = VOTE_HOOKS.remove_hook_by_index(deps.storage, msg.id)?;
+    let hook = VOTE_HOOK_REPLIES
+        .may_load(deps.storage, msg.id)?
+        .ok_or(ContractError::UnknownVoteHookReply(msg.id))?;
+    VOTE_HOOK_REPLIES.remove(deps.storage, msg.id);
+
+    if msg.result.is_ok() {
+        return Ok(Response::new()
+            .add_attribute("action", "vote_hook_succeeded")
+            .add_attribute("hook", hook)
+            .add_attribute("reply_id", msg.id.to_string()));
+    }
+
+    VOTE_HOOKS.remove_hook(deps.storage, hook.clone())?;
     Ok(Response::new()
         .add_attribute("action", "remove_failed_vote_hook")
-        .add_attribute("hook", removed.to_string())
-        .add_attribute("index", msg.id.to_string()))
+        .add_attribute("hook", hook)
+        .add_attribute("reply_id", msg.id.to_string()))
 }
 
 mod query {
     use super::*;
 
-    use crate::msg::{LastExecutedSetResponse, VoteInfo, VoteResponse};
+    use crate::msg::{GaugeHealthResponse, LastExecutedSetResponse, VoteInfo, VoteResponse};
     use dao_interface::voting::InfoResponse;
 
     pub fn info(deps: Deps) -> StdResult<InfoResponse> {
         let info = cw2::get_contract_version(deps.storage)?;
         Ok(InfoResponse { info })
+    }
+
+    pub fn config(deps: Deps) -> StdResult<ConfigResponse> {
+        let config = CONFIG.load(deps.storage)?;
+        Ok(ConfigResponse {
+            owner: config.owner.into_string(),
+            dao_core: config.dao_core.into_string(),
+            voting_powers: config.voting_powers.into_string(),
+            hook_caller: config.hook_caller.into_string(),
+        })
     }
 
     fn to_gauge_response(gauge_id: GaugeId, gauge: Gauge) -> GaugeResponse {
@@ -1054,12 +2170,94 @@ mod query {
             options: TALLY
                 .prefix(gauge_id)
                 .range(deps.storage, start_after, None, Order::Ascending)
+                .filter(|item| match item {
+                    Ok((option, _)) => {
+                        !INVALID_OPTIONS.has(deps.storage, (gauge_id, option.as_str()))
+                    }
+                    Err(_) => true,
+                })
                 .map(|option| {
                     let (option, power) = option?;
                     Ok((option, Uint128::new(power)))
                 })
                 .take(limit)
                 .collect::<StdResult<Vec<(String, Uint128)>>>()?,
+        })
+    }
+
+    pub fn gauge_health(deps: Deps, gauge_id: GaugeId) -> StdResult<GaugeHealthResponse> {
+        GAUGES.load(deps.storage, gauge_id)?;
+
+        let options = TALLY
+            .prefix(gauge_id)
+            .range(deps.storage, None, None, Order::Ascending)
+            .take(MAX_OPTIONS_PER_GAUGE + 1)
+            .collect::<StdResult<Vec<_>>>()?;
+        let scan_complete = options.len() <= MAX_OPTIONS_PER_GAUGE;
+        let options = options
+            .into_iter()
+            .take(MAX_OPTIONS_PER_GAUGE)
+            .collect::<Vec<_>>();
+
+        let mut tally_sum = Uint128::zero();
+        let mut active_option_count = 0u32;
+        let mut invalid_option_count = 0u32;
+        let mut mismatch_count = 0u32;
+        let mut first_mismatch = None;
+        for (option, points) in &options {
+            tally_sum = tally_sum
+                .checked_add(Uint128::new(*points))
+                .map_err(StdError::overflow)?;
+            let invalid = INVALID_OPTIONS.has(deps.storage, (gauge_id, option.as_str()));
+            if invalid {
+                invalid_option_count += 1;
+            } else {
+                active_option_count += 1;
+            }
+            let indexed = OPTION_BY_POINTS.has(deps.storage, (gauge_id, *points, option));
+            if indexed == invalid {
+                mismatch_count += 1;
+                first_mismatch.get_or_insert_with(|| option.clone());
+            }
+        }
+
+        let index_entries = OPTION_BY_POINTS
+            .sub_prefix(gauge_id)
+            .range(deps.storage, None, None, Order::Ascending)
+            .take(MAX_OPTIONS_PER_GAUGE + 1)
+            .collect::<StdResult<Vec<_>>>()?;
+        let index_scan_complete = index_entries.len() <= MAX_OPTIONS_PER_GAUGE;
+        let indexed_option_count = index_entries.len().min(MAX_OPTIONS_PER_GAUGE) as u32;
+        for ((points, option), _) in index_entries.into_iter().take(MAX_OPTIONS_PER_GAUGE) {
+            let valid = TALLY
+                .may_load(deps.storage, (gauge_id, option.as_str()))?
+                .is_some_and(|stored| stored == points)
+                && !INVALID_OPTIONS.has(deps.storage, (gauge_id, option.as_str()));
+            if !valid {
+                mismatch_count += 1;
+                first_mismatch.get_or_insert(option);
+            }
+        }
+
+        let total_cast = Uint128::new(TOTAL_CAST.load(deps.storage, gauge_id)?);
+        let scan_complete = scan_complete && index_scan_complete;
+        let consistent = scan_complete
+            && mismatch_count == 0
+            && tally_sum == total_cast
+            && indexed_option_count == active_option_count;
+        Ok(GaugeHealthResponse {
+            gauge_id,
+            option_count: options.len() as u32,
+            active_option_count,
+            invalid_option_count,
+            indexed_option_count,
+            tally_sum,
+            total_cast,
+            mismatch_count,
+            first_mismatch,
+            reset_cursor: RESET_CURSOR.may_load(deps.storage, gauge_id)?,
+            scan_complete,
+            consistent,
         })
     }
 
@@ -1075,7 +2273,7 @@ mod query {
         // given our requirements. Storage iteration errors are not consumed
         // here; they pass through the filter and are propagated by the `?`
         // inside the `.map(...)` below.
-        let votes = OPTION_BY_POINTS
+        let candidates = OPTION_BY_POINTS
             .sub_prefix(gauge_id)
             .range(deps.storage, None, None, Order::Descending)
             .filter(|item| match item {
@@ -1095,15 +2293,45 @@ mod query {
                 // If gauge has max_available_percentage set, discard all power
                 // above that percentage
                 if let Some(max_available_percentage) = gauge.max_available_percentage {
-                    if Decimal::from_ratio(power, total_cast) > max_available_percentage {
+                    // Equality produces the same power either way; make the
+                    // inclusive boundary explicit and deterministic.
+                    if Decimal::from_ratio(power, total_cast) >= max_available_percentage {
                         // If power is above available percentage, cut power down to max available
                         return Ok((option, Uint128::new(total_cast) * max_available_percentage));
                     }
                 }
                 Ok((option, Uint128::new(power)))
             })
-            .take(gauge.max_options_selected as usize)
+            // The option namespace is contract-bounded. Scan at most that
+            // bound here, then apply `max_options_selected` after adapter
+            // validity filtering so rejected leaders cannot consume slots
+            // that should go to valid lower-ranked candidates.
+            .take(MAX_OPTIONS_PER_GAUGE)
             .collect::<StdResult<Vec<(String, Uint128)>>>()?;
+
+        // Pull-sync adapter validity for the bounded candidate set. This
+        // prevents a marketing rejection/removal from remaining payable even
+        // when the orchestrator still retains its local tally tombstone.
+        let mut votes = candidates
+            .into_iter()
+            .map(|(option, power)| {
+                let validity: CheckOptionResponse = deps.querier.query_wasm_smart(
+                    gauge.adapter.clone(),
+                    &AdapterQueryMsg::CheckOption {
+                        option: option.clone(),
+                    },
+                )?;
+                Ok(validity.valid.then_some((option, power)))
+            })
+            .collect::<StdResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        // Tiny caps can round otherwise qualifying entries to zero. Exclude
+        // them so execution becomes the documented no-op rather than emitting
+        // zero-amount adapter messages.
+        votes.retain(|(_, power)| !power.is_zero());
+        votes.truncate(gauge.max_options_selected as usize);
 
         Ok(SelectedSetResponse { votes })
     }
@@ -1118,36 +2346,367 @@ mod query {
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
-    ensure_from_older_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-
-    for (gauge_id, config) in msg.gauge_config.unwrap_or_default() {
-        GAUGES.update(deps.storage, gauge_id, |gauge| -> StdResult<_> {
-            let mut gauge = gauge.ok_or(StdError::NotFound {
+    let previous = get_contract_version(deps.storage)?;
+    if previous.contract != CONTRACT_NAME {
+        return Err(StdError::generic_err(format!(
+            "cannot migrate contract {}; expected {CONTRACT_NAME}",
+            previous.contract
+        ))
+        .into());
+    }
+    let from = semver::Version::parse(&previous.version)
+        .map_err(|error| StdError::generic_err(format!("invalid stored version: {error}")))?;
+    let to = semver::Version::parse(CONTRACT_VERSION)
+        .map_err(|error| StdError::generic_err(format!("invalid target version: {error}")))?;
+    if from >= to {
+        return Err(StdError::generic_err(format!(
+            "migration requires an older version; stored {from}, target {to}"
+        ))
+        .into());
+    }
+    if !SUPPORTED_MIGRATION_SOURCES.contains(&previous.version.as_str()) {
+        return Err(ContractError::UnsupportedMigrationSource {
+            version: previous.version,
+        });
+    }
+    let gauge_configs = msg.gauge_config.unwrap_or_default();
+    if gauge_configs.len() > MAX_GAUGES as usize {
+        return Err(ContractError::TooManyGaugeMigrationConfigs {
+            count: gauge_configs.len(),
+            max: MAX_GAUGES as usize,
+        });
+    }
+    let migrated_records = gauge_configs.len();
+    let mut seen = std::collections::HashSet::with_capacity(migrated_records);
+    let mut updates = Vec::with_capacity(migrated_records);
+    for (gauge_id, config) in gauge_configs {
+        if !seen.insert(gauge_id) {
+            return Err(ContractError::DuplicateGaugeMigrationConfig { gauge_id });
+        }
+        let mut gauge = GAUGES
+            .may_load(deps.storage, gauge_id)?
+            .ok_or(StdError::NotFound {
                 kind: format!("Gauge with id {}", gauge_id),
             })?;
-            if let Some(next_epoch) = config.next_epoch {
-                if next_epoch < env.block.time.seconds() {
-                    return Err(StdError::GenericErr {
-                        msg: "Next epoch value cannot be earlier then current epoch!".to_owned(),
-                    });
+        if let Some(next_epoch) = config.next_epoch {
+            if next_epoch < env.block.time.seconds() {
+                return Err(StdError::GenericErr {
+                    msg: "Next epoch value cannot be earlier then current epoch!".to_owned(),
                 }
-                gauge.next_epoch = next_epoch;
+                .into());
             }
-            if let Some(reset_config) = config.reset {
-                if reset_config.next_reset < env.block.time.seconds() {
-                    return Err(StdError::GenericErr {
-                        msg: "Next reset value cannot be earlier then current epoch!".to_owned(),
-                    });
+            gauge.next_epoch = next_epoch;
+        }
+        if let Some(reset_config) = config.reset {
+            if reset_config.reset_epoch == 0 {
+                return Err(StdError::GenericErr {
+                    msg: "Reset epoch must be greater than zero".to_owned(),
                 }
-                gauge.reset = Some(Reset {
-                    last: gauge.reset.map(|r| r.last).unwrap_or_default(),
-                    reset_each: reset_config.reset_epoch,
-                    next: reset_config.next_reset,
-                });
+                .into());
             }
-            Ok(gauge)
-        })?;
+            if reset_config.next_reset < env.block.time.seconds() {
+                return Err(StdError::GenericErr {
+                    msg: "Next reset value cannot be earlier then current epoch!".to_owned(),
+                }
+                .into());
+            }
+            gauge.reset = Some(Reset {
+                last: gauge.reset.map(|r| r.last).unwrap_or_default(),
+                reset_each: reset_config.reset_epoch,
+                next: reset_config.next_reset,
+            });
+        }
+        updates.push((gauge_id, gauge));
     }
 
-    Ok(Response::new())
+    // All application-level validation is complete before cw2 or gauge state
+    // is changed, which also makes direct unit tests observe atomic failures.
+    ensure_from_older_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+    for (gauge_id, gauge) in updates {
+        GAUGES.save(deps.storage, gauge_id, &gauge)?;
+    }
+
+    Ok(Response::new()
+        .add_attribute("action", "migrate")
+        .add_attribute("from_version", previous.version)
+        .add_attribute("to_version", CONTRACT_VERSION)
+        .add_attribute("migrated_records", migrated_records.to_string()))
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::{
+        msg::GaugeMigrationConfig,
+        state::{Vote, WeightedVotes},
+    };
+    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+
+    fn sample_gauge(next_epoch: u64) -> Gauge {
+        Gauge {
+            title: "populated".to_owned(),
+            adapter: Addr::unchecked("adapter"),
+            epoch: 604_800,
+            min_percent_selected: Some(Decimal::percent(5)),
+            max_options_selected: 10,
+            max_available_percentage: None,
+            is_stopped: false,
+            next_epoch,
+            last_executed_set: Some(vec![("option".to_owned(), Uint128::new(25))]),
+            reset: None,
+        }
+    }
+
+    #[test]
+    fn migration_preserves_populated_state_and_reports_versions() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+        instantiate(
+            deps.as_mut(),
+            env.clone(),
+            mock_info("dao", &[]),
+            InstantiateMsg {
+                voting_powers: "powers".to_owned(),
+                hook_caller: "hook".to_owned(),
+                owner: "owner".to_owned(),
+                gauges: None,
+            },
+        )
+        .unwrap();
+        let old_epoch = env.block.time.seconds() + 100;
+        let new_epoch = env.block.time.seconds() + 200;
+        GAUGES
+            .save(deps.as_mut().storage, 0, &sample_gauge(old_epoch))
+            .unwrap();
+        let voter = Addr::unchecked("voter");
+        let weighted = WeightedVotes {
+            gauge_id: 0,
+            power: Uint128::new(25),
+            votes: vec![Vote {
+                option: "option".to_owned(),
+                weight: Decimal::one(),
+            }],
+            cast: Some(env.block.time.seconds()),
+        };
+        votes()
+            .save(deps.as_mut().storage, &voter, 0, &weighted)
+            .unwrap();
+        TALLY
+            .save(deps.as_mut().storage, (0, "option"), &25)
+            .unwrap();
+        TOTAL_CAST.save(deps.as_mut().storage, 0, &25).unwrap();
+        OPTION_BY_POINTS
+            .save(deps.as_mut().storage, (0, 25, "option"), &1)
+            .unwrap();
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, "2.5.0").unwrap();
+
+        let response = migrate(
+            deps.as_mut(),
+            env,
+            MigrateMsg {
+                gauge_config: Some(vec![(
+                    0,
+                    GaugeMigrationConfig {
+                        next_epoch: Some(new_epoch),
+                        reset: None,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            GAUGES.load(deps.as_ref().storage, 0).unwrap().next_epoch,
+            new_epoch
+        );
+        assert_eq!(
+            votes().load(deps.as_ref().storage, &voter, 0).unwrap(),
+            weighted
+        );
+        assert_eq!(
+            TALLY.load(deps.as_ref().storage, (0, "option")).unwrap(),
+            25
+        );
+        assert_eq!(TOTAL_CAST.load(deps.as_ref().storage, 0).unwrap(), 25);
+        assert!(OPTION_BY_POINTS.has(deps.as_ref().storage, (0, 25, "option")));
+        assert!(response
+            .attributes
+            .iter()
+            .any(|attribute| { attribute.key == "from_version" && attribute.value == "2.5.0" }));
+        assert!(response
+            .attributes
+            .iter()
+            .any(|attribute| { attribute.key == "migrated_records" && attribute.value == "1" }));
+    }
+
+    #[test]
+    fn migration_rejects_identity_versions_and_unbounded_or_duplicate_configs() {
+        for (contract, version) in [
+            ("wrong-contract", "0.1.0"),
+            (CONTRACT_NAME, "2.4.1"),
+            (CONTRACT_NAME, CONTRACT_VERSION),
+            (CONTRACT_NAME, "99.0.0"),
+        ] {
+            let mut deps = mock_dependencies();
+            set_contract_version(deps.as_mut().storage, contract, version).unwrap();
+            assert!(migrate(deps.as_mut(), mock_env(), MigrateMsg { gauge_config: None }).is_err());
+            assert_eq!(
+                get_contract_version(deps.as_ref().storage).unwrap().version,
+                version
+            );
+        }
+
+        // The exact migration bound is accepted, and timestamps equal to the
+        // current block are valid for both epoch and reset schedules.
+        let mut exact = mock_dependencies();
+        let env = mock_env();
+        set_contract_version(exact.as_mut().storage, CONTRACT_NAME, "2.5.0").unwrap();
+        for id in 0..MAX_GAUGES {
+            GAUGES
+                .save(exact.as_mut().storage, id, &sample_gauge(u64::MAX))
+                .unwrap();
+        }
+        let exact_configs = (0..MAX_GAUGES)
+            .map(|id| {
+                let config = if id == 0 {
+                    GaugeMigrationConfig {
+                        next_epoch: Some(env.block.time.seconds()),
+                        reset: Some(crate::msg::ResetMigrationConfig {
+                            reset_epoch: 1,
+                            next_reset: env.block.time.seconds(),
+                        }),
+                    }
+                } else {
+                    GaugeMigrationConfig::default()
+                };
+                (id, config)
+            })
+            .collect();
+        let response = migrate(
+            exact.as_mut(),
+            env.clone(),
+            MigrateMsg {
+                gauge_config: Some(exact_configs),
+            },
+        )
+        .unwrap();
+        assert!(response.attributes.iter().any(|attribute| {
+            attribute.key == "migrated_records" && attribute.value == MAX_GAUGES.to_string()
+        }));
+        let gauge = GAUGES.load(exact.as_ref().storage, 0).unwrap();
+        assert_eq!(gauge.next_epoch, env.block.time.seconds());
+        assert_eq!(gauge.reset.unwrap().next, env.block.time.seconds());
+
+        let mut deps = mock_dependencies();
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, "2.5.0").unwrap();
+        let oversized = (0..=MAX_GAUGES)
+            .map(|id| (id, GaugeMigrationConfig::default()))
+            .collect();
+        assert_eq!(
+            migrate(
+                deps.as_mut(),
+                mock_env(),
+                MigrateMsg {
+                    gauge_config: Some(oversized),
+                },
+            )
+            .unwrap_err(),
+            ContractError::TooManyGaugeMigrationConfigs {
+                count: MAX_GAUGES as usize + 1,
+                max: MAX_GAUGES as usize,
+            }
+        );
+
+        GAUGES
+            .save(deps.as_mut().storage, 0, &sample_gauge(u64::MAX))
+            .unwrap();
+        assert_eq!(
+            migrate(
+                deps.as_mut(),
+                mock_env(),
+                MigrateMsg {
+                    gauge_config: Some(vec![
+                        (0, GaugeMigrationConfig::default()),
+                        (0, GaugeMigrationConfig::default()),
+                    ]),
+                },
+            )
+            .unwrap_err(),
+            ContractError::DuplicateGaugeMigrationConfig { gauge_id: 0 }
+        );
+        assert_eq!(
+            get_contract_version(deps.as_ref().storage).unwrap().version,
+            "2.5.0"
+        );
+
+        let env = mock_env();
+        GAUGES
+            .save(deps.as_mut().storage, 1, &sample_gauge(u64::MAX - 1))
+            .unwrap();
+        let err = migrate(
+            deps.as_mut(),
+            env.clone(),
+            MigrateMsg {
+                gauge_config: Some(vec![
+                    (
+                        0,
+                        GaugeMigrationConfig {
+                            next_epoch: Some(env.block.time.seconds() + 10),
+                            reset: None,
+                        },
+                    ),
+                    (
+                        1,
+                        GaugeMigrationConfig {
+                            next_epoch: Some(env.block.time.seconds() - 1),
+                            reset: None,
+                        },
+                    ),
+                ]),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Next epoch value"));
+        assert_eq!(
+            GAUGES.load(deps.as_ref().storage, 0).unwrap().next_epoch,
+            u64::MAX
+        );
+        assert_eq!(
+            GAUGES.load(deps.as_ref().storage, 1).unwrap().next_epoch,
+            u64::MAX - 1
+        );
+        assert_eq!(
+            get_contract_version(deps.as_ref().storage).unwrap().version,
+            "2.5.0"
+        );
+    }
+
+    #[test]
+    fn migration_accepts_supported_2_4_2_populated_state() {
+        let mut deps = mock_dependencies();
+        let gauge = sample_gauge(1_234);
+        GAUGES.save(deps.as_mut().storage, 0, &gauge).unwrap();
+        TALLY
+            .save(deps.as_mut().storage, (0, "option"), &42)
+            .unwrap();
+        TOTAL_CAST.save(deps.as_mut().storage, 0, &42).unwrap();
+        OPTION_BY_POINTS
+            .save(deps.as_mut().storage, (0, 42, "option"), &1)
+            .unwrap();
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, "2.4.2").unwrap();
+
+        let response =
+            migrate(deps.as_mut(), mock_env(), MigrateMsg { gauge_config: None }).unwrap();
+        assert_eq!(GAUGES.load(deps.as_ref().storage, 0).unwrap(), gauge);
+        assert_eq!(
+            TALLY.load(deps.as_ref().storage, (0, "option")).unwrap(),
+            42
+        );
+        assert_eq!(TOTAL_CAST.load(deps.as_ref().storage, 0).unwrap(), 42);
+        assert!(OPTION_BY_POINTS.has(deps.as_ref().storage, (0, 42, "option")));
+        assert!(response
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key == "from_version" && attribute.value == "2.4.2"));
+    }
 }

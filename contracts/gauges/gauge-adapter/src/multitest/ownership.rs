@@ -1,9 +1,10 @@
-use cosmwasm_std::{coin, Uint128};
+use cosmwasm_std::{coin, Addr, Uint128};
 use cw_denom::UncheckedDenom;
+use cw_multi_test::AppResponse;
 use cw_ownable::{Action, Ownership, OwnershipError};
 
 use crate::{
-    msg::{AdapterQueryMsg, AssetUnchecked, ExecuteMsg},
+    msg::{AssetUnchecked, ExecuteMsg, QueryMsg as AdapterQueryMsg},
     multitest::suite::{addr, Suite},
     ContractError,
 };
@@ -13,6 +14,25 @@ fn deposit_required() -> AssetUnchecked {
         denom: UncheckedDenom::Native("juno".into()),
         amount: Uint128::new(1_000),
     }
+}
+
+fn assert_ownership_event(response: &AppResponse, sender: &Addr, owner: &str, pending_owner: &str) {
+    assert!(response.events.iter().any(|event| {
+        let has = |key: &str, value: &str| {
+            event
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == key && attribute.value == value)
+        };
+        has("action", "update_ownership")
+            && has("sender", sender.as_str())
+            && has("owner", owner)
+            && has("pending_owner", pending_owner)
+            && event
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "pending_expiry")
+    }));
 }
 
 #[test]
@@ -44,12 +64,18 @@ fn transfer_ownership_two_step_flow() {
         .unwrap();
 
     // Old owner proposes transfer.
-    suite
+    let transfer = suite
         .execute_owner(&ExecuteMsg::UpdateOwnership(Action::TransferOwnership {
             new_owner: new_owner.to_string(),
             expiry: None,
         }))
         .unwrap();
+    assert_ownership_event(
+        &transfer,
+        &old_owner,
+        old_owner.as_str(),
+        new_owner.as_str(),
+    );
 
     // Until accepted, pending owner cannot exercise authority.
     let err = suite
@@ -68,13 +94,14 @@ fn transfer_ownership_two_step_flow() {
     );
 
     // New owner accepts.
-    suite
+    let accept = suite
         .execute(
             &new_owner,
             &ExecuteMsg::UpdateOwnership(Action::AcceptOwnership),
             &[],
         )
         .unwrap();
+    assert_ownership_event(&accept, &new_owner, new_owner.as_str(), "none");
 
     // New owner can now reject; old owner cannot.
     suite
@@ -117,9 +144,10 @@ fn renounce_ownership_locks_owner_methods() {
         .unwrap();
 
     // Owner renounces.
-    suite
+    let renounce = suite
         .execute_owner(&ExecuteMsg::UpdateOwnership(Action::RenounceOwnership))
         .unwrap();
+    assert_ownership_event(&renounce, &owner, "none", "none");
 
     // No one can call owner-gated methods now.
     let err = suite

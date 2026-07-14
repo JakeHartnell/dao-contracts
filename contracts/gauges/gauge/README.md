@@ -30,6 +30,15 @@ see [`contracts/gauges/README.md`](../README.md) for the bigger picture.
    cadence — useful for periodically pruning stale options without
    restarting the gauge.
 
+### Stopping and resuming
+
+The owner can call `StopGauge` to freeze new votes, periodic reset work, and
+epoch execution. Stake, NFT-stake, and membership hooks deliberately continue
+to update the power behind existing votes while stopped. This keeps tallies
+current and prevents a stopped gauge from blocking unrelated staking actions.
+`ResumeGauge` is owner-only and re-enables the frozen operations without
+discarding votes or changing the existing epoch schedule.
+
 ## Why one orchestrator for many gauges
 
 Each staking hook adds a CosmWasm call to every staking action. With N
@@ -51,6 +60,30 @@ Per-gauge config lives on the `Gauge` struct in `state.rs`. Mutable via
 | `max_available_percentage` | Optional ceiling: an option's effective weight is clamped to this fraction (excess goes to no one). |
 | `reset` | Optional periodic option-list refresh. |
 
+## Enforced resource limits
+
+The contract rejects state or payloads above these limits before performing
+accounting work:
+
+| Resource | Maximum |
+|---|---:|
+| Gauges per orchestrator | 100 |
+| Options per gauge, including initial adapter options | 100 |
+| Weighted option entries in one vote | 100 |
+| Active gauge vote records per voter | 100 |
+| Vote-hook subscribers | 10 |
+| Adapter messages returned for one execution | 100 |
+| Members in one cw4 power-change hook | 100 |
+| Token IDs in one NFT unstake hook | 100 |
+| Reset batch size | 100 (minimum 1) |
+| Title or option byte length | 128 |
+| Rows returned by a paginated list query | 100 |
+
+The member-hook limit and per-voter gauge limit compose: a maximum-size cw4
+hook may update at most 10,000 stored gauge votes. Production approval still
+requires target-chain worst-case gas measurements with a documented safety
+margin; these structural bounds are not a substitute for that evidence.
+
 ## Adapter contract (`AdapterQueryMsg`)
 
 Every adapter must answer:
@@ -63,6 +96,26 @@ Every adapter must answer:
 
 See [`gauge-adapter/README.md`](../gauge-adapter/README.md) for a worked
 example.
+
+### Adapter trust boundary
+
+An attached adapter is trusted with the DAO core's execution authority for
+each epoch: `SampleGaugeMsgs` may return arbitrary `CosmosMsg` values, and the
+orchestrator forwards them without restricting message type, destination,
+denomination, or amount. DAO governance must therefore audit and explicitly
+approve each adapter code ID and configuration. The orchestrator is not an
+allowlist or spending-limit layer; deployments that require narrower authority
+must enforce it in the adapter and DAO proposal policy.
+
+### Turnout policy
+
+There is intentionally no minimum turnout or quorum. Selection percentages use
+only `TOTAL_CAST` (power allocated by participating voters), so one low-power
+voter can direct the full epoch allocation when nobody else votes. This favors
+keeper liveness and permits thinly participated gauges, but exposes budgets to
+low-turnout capture. DAOs that do not accept that economic risk should not fund
+the gauge until an audited adapter or orchestrator version enforces an explicit
+turnout threshold.
 
 ## Voting power edge cases
 
@@ -89,6 +142,22 @@ Key collections (see `state.rs`):
   top-N selection.
 - `TOTAL_CAST: Map<GaugeId, u128>` — denominator for percent math.
 - `votes()` — indexed map keyed `(voter, gauge_id) → Vote`.
+
+### Health and reconciliation
+
+`QueryMsg::GaugeHealth { gauge }` performs a bounded consistency scan of the
+gauge's option tallies and sorted selection index. Its `consistent` flag checks
+that `TALLY` sums to `TOTAL_CAST`, every active tally has the expected sorted
+index entry, tombstoned options have none, and no stale index entries remain.
+The response also reports active/invalid/indexed counts, the first mismatch,
+and any reset cursor. A tombstoned option's tally legitimately remains in
+`TOTAL_CAST` while stored votes reference it; tombstoning removes only its
+eligibility for selection. Even at zero tally the tombstone is retained until
+bounded reset cleanup, because a zero-power voter may later stake again.
+
+The scan is capped by the contract's option limit. `scan_complete=false` or
+`consistent=false` requires operator investigation; use the paginated option
+and vote queries to identify affected records rather than editing raw storage.
 
 ## Hooks the orchestrator must be registered against
 
@@ -124,7 +193,20 @@ etc.). The hook payload type is
 | `GetHooks {}` | `GetHooksResponse { hooks: Vec<String> }` | List current subscribers. |
 
 Subscriber failure is non-fatal to the voter: submessages use
-`reply_on_error`, and the orchestrator's `reply` handler auto-drops a
-failing subscriber by index so its broken callback can't keep blocking
-gas on future votes. Adding a participation-reward consumer is therefore
-safe to attempt — a misconfigured downstream contract is self-pruning.
+`reply_on_error`, and each reply ID is mapped to the subscriber's stable
+address before dispatch. The `reply` handler removes exactly that address,
+so simultaneous failures cannot shift an index and remove a healthy hook.
+The mapping is consumed on both success and failure replies, and a
+misconfigured downstream contract is self-pruning for future votes.
+
+## Migration compatibility
+
+The cw2 identity is `crates.io:gauge` (the workspace package and artifact are
+named `gauge-orchestrator`). The supported source-version matrix is exactly
+`2.4.2` and `2.5.0`, the two historical workspace versions under which the
+development gauge branch was built. Other older versions, same/newer versions,
+and other contract identities are rejected. `MigrateMsg.gauge_config`
+optionally updates explicitly named gauges' future epoch/reset deadlines while
+preserving votes, tallies, options, hooks, and all other gauges. The response
+reports `from_version`, `to_version`, and `migrated_records` for proposal and
+indexer verification.

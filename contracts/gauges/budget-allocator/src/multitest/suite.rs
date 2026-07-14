@@ -4,12 +4,12 @@ use cw_multi_test::{App, AppResponse, ContractWrapper, Executor};
 use serde::de::DeserializeOwned;
 
 use crate::{
-    contract::{execute, instantiate, migrate, query},
+    contract::{execute, instantiate, query},
     msg::{ExecuteMsg, InstantiateMsg, QueryMsg},
 };
 
 pub fn contract() -> Box<dyn cw_multi_test::Contract<Empty>> {
-    Box::new(ContractWrapper::new_with_empty(execute, instantiate, query).with_migrate(migrate))
+    Box::new(ContractWrapper::new_with_empty(execute, instantiate, query))
 }
 
 pub fn addr(name: &str) -> Addr {

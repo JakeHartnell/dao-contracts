@@ -1,15 +1,93 @@
-use cosmwasm_std::{Addr, Decimal, Uint128};
+use cosmwasm_std::{coin, to_json_binary, Addr, Decimal, Empty, Uint128};
 use cw4::Member;
-use cw_multi_test::Executor;
+use cw_multi_test::{AppResponse, BankSudo, Contract, ContractWrapper, Executor, SudoMsg};
 use dao_hooks::nft_stake::{NftStakeChangedExecuteMsg, NftStakeChangedHookMsg};
 use dao_hooks::stake::StakeChangedExecuteMsg;
 use dao_voting::voting::Vote;
 
 use super::suite::SuiteBuilder;
 use crate::error::ContractError;
-use crate::msg::VoteInfo;
+use crate::msg::{InstantiateMsg, VoteInfo};
 
 const EPOCH: u64 = 7 * 86_400;
+
+fn assert_mutation_event(response: &AppResponse, expected: &[(&str, &str)]) {
+    assert!(
+        response.events.iter().any(|event| {
+            expected.iter().all(|(key, value)| {
+                event
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key == *key && attribute.value == *value)
+            })
+        }),
+        "missing event attributes {expected:?} in {:?}",
+        response.events
+    );
+}
+
+fn cw20_contract() -> Box<dyn Contract<Empty>> {
+    Box::new(ContractWrapper::new_with_empty(
+        cw20_base::contract::execute,
+        cw20_base::contract::instantiate,
+        cw20_base::contract::query,
+    ))
+}
+
+fn cw20_stake_contract() -> Box<dyn Contract<Empty>> {
+    Box::new(
+        ContractWrapper::new_with_empty(
+            cw20_stake::contract::execute,
+            cw20_stake::contract::instantiate,
+            cw20_stake::contract::query,
+        )
+        .with_migrate(cw20_stake::contract::migrate),
+    )
+}
+
+fn cw20_voting_contract() -> Box<dyn Contract<Empty>> {
+    Box::new(
+        ContractWrapper::new_with_empty(
+            dao_voting_cw20_staked::contract::execute,
+            dao_voting_cw20_staked::contract::instantiate,
+            dao_voting_cw20_staked::contract::query,
+        )
+        .with_reply_empty(dao_voting_cw20_staked::contract::reply)
+        .with_migrate(dao_voting_cw20_staked::contract::migrate),
+    )
+}
+
+fn cw721_contract() -> Box<dyn Contract<Empty>> {
+    Box::new(ContractWrapper::new_with_empty(
+        cw721_base::entry::execute,
+        cw721_base::entry::instantiate,
+        cw721_base::entry::query,
+    ))
+}
+
+fn cw721_voting_contract() -> Box<dyn Contract<Empty>> {
+    Box::new(
+        ContractWrapper::new_with_empty(
+            dao_voting_cw721_staked::contract::execute,
+            dao_voting_cw721_staked::contract::instantiate,
+            dao_voting_cw721_staked::contract::query,
+        )
+        .with_reply_empty(dao_voting_cw721_staked::contract::reply)
+        .with_migrate(dao_voting_cw721_staked::contract::migrate),
+    )
+}
+
+fn native_voting_contract() -> Box<dyn Contract<Empty>> {
+    Box::new(
+        ContractWrapper::new_with_empty(
+            dao_voting_token_staked::contract::execute,
+            dao_voting_token_staked::contract::instantiate,
+            dao_voting_token_staked::contract::query,
+        )
+        .with_reply_empty(dao_voting_token_staked::contract::reply)
+        .with_migrate(dao_voting_token_staked::contract::migrate),
+    )
+}
 
 #[test]
 fn add_option() {
@@ -105,6 +183,7 @@ fn remove_option() {
     let voter2 = "voter2";
     let mut suite = SuiteBuilder::new()
         .with_voting_members(&[(voter1, 100), (voter2, 200)])
+        .with_core_balance((1_000, "ujuno"))
         .build();
 
     suite.next_block();
@@ -173,10 +252,31 @@ fn remove_option() {
         ]
     );
 
-    // owner can remove an option that has been added already
+    // Remove an option with an active voter. It disappears from selection
+    // immediately, while its tombstone lets replacement subtract the old
+    // contribution without underflow.
+    suite
+        .place_vote(
+            &gauge_contract,
+            voter1,
+            gauge_id,
+            Some("addedoption1".to_owned()),
+        )
+        .unwrap();
     suite
         .remove_option(&gauge_contract, owner, gauge_id, "addedoption1")
         .unwrap();
+    assert!(suite
+        .query_selected_set(&gauge_contract, gauge_id)
+        .unwrap()
+        .is_empty());
+    suite
+        .place_vote(&gauge_contract, voter1, gauge_id, Some(voter1.to_owned()))
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge_contract, gauge_id).unwrap(),
+        vec![(voter1.to_owned(), Uint128::new(100))]
+    );
 
     // Anyone else cannot remove options
     let err = suite
@@ -191,12 +291,27 @@ fn remove_option() {
         options,
         vec![
             ("addedoption2".to_owned(), Uint128::zero()),
-            ("voter1".to_owned(), Uint128::zero()),
+            ("voter1".to_owned(), Uint128::new(100)),
             ("voter2".to_owned(), Uint128::zero())
         ]
     );
 
+    suite
+        .place_vote(
+            &gauge_contract,
+            voter2,
+            gauge_id,
+            Some("addedoption2".to_owned()),
+        )
+        .unwrap();
     suite.invalidate_option(&adapter, "addedoption2").unwrap();
+    // Adapter validity is pull-synchronized for the bounded selected set, so
+    // a rejected marketing entry cannot remain payable through stale local
+    // orchestrator state.
+    assert_eq!(
+        suite.query_selected_set(&gauge_contract, gauge_id).unwrap(),
+        vec![(voter1.to_owned(), Uint128::new(100))]
+    );
 
     // owner can remove an option that is no longer valid
     suite
@@ -208,10 +323,187 @@ fn remove_option() {
     assert_eq!(
         options,
         vec![
-            ("voter1".to_owned(), Uint128::zero()),
+            ("voter1".to_owned(), Uint128::new(100)),
             ("voter2".to_owned(), Uint128::zero())
         ]
     );
+    let health = suite.query_gauge_health(&gauge_contract, gauge_id).unwrap();
+    assert!(health.scan_complete);
+    assert!(health.consistent);
+    // Both removed entries remain tombstoned, including the zero-valued one,
+    // until reset proves it is safe to garbage-collect stored references.
+    assert_eq!(health.option_count, 4);
+    assert_eq!(health.active_option_count, 2);
+    assert_eq!(health.invalid_option_count, 2);
+    assert_eq!(health.indexed_option_count, 2);
+    assert_eq!(health.tally_sum, Uint128::new(300));
+    assert_eq!(health.total_cast, Uint128::new(300));
+    assert_eq!(health.mismatch_count, 0);
+
+    // Epoch execution pull-checks adapter validity and pays only the remaining
+    // active option; neither locally removed option can re-enter the sample.
+    suite.advance_time(EPOCH);
+    suite
+        .execute_options(&gauge_contract, voter1, gauge_id)
+        .unwrap();
+    // Only one third of total voting power remains cast, so the other two
+    // thirds stay unallocated under the burn-excess policy.
+    assert_eq!(suite.query_balance(voter1, "ujuno").unwrap(), 333);
+    assert_eq!(suite.query_balance(voter2, "ujuno").unwrap(), 0);
+}
+
+#[test]
+fn removed_option_survives_real_cw4_power_hook_and_vote_replacement() {
+    let owner = "owner";
+    let voter = "voter";
+    let mut suite = SuiteBuilder::new()
+        .with_voting_members(&[(voter, 100)])
+        .build();
+
+    suite.next_block();
+    suite
+        .propose_update_proposal_module(voter.to_owned(), None)
+        .unwrap();
+    suite.next_block();
+    let proposal = suite.list_proposals().unwrap()[0];
+    suite.place_vote_single(voter, proposal, Vote::Yes).unwrap();
+    suite.next_block();
+    suite
+        .execute_single_proposal(voter.to_owned(), proposal)
+        .unwrap();
+    let gauge = suite.query_proposal_modules().unwrap()[1].clone();
+
+    // Register through the real DAO/CW4 governance path rather than invoking
+    // the orchestrator's hook entry point directly.
+    suite
+        .propose_add_membership_change_hook(voter.to_owned(), gauge.clone())
+        .unwrap();
+    let hook_proposal = suite.list_proposals().unwrap()[1];
+    suite
+        .place_vote_single(voter, hook_proposal, Vote::Yes)
+        .unwrap();
+    suite.next_block();
+    suite
+        .execute_single_proposal(voter.to_owned(), hook_proposal)
+        .unwrap();
+
+    suite
+        .instantiate_adapter_and_create_gauge(
+            gauge.clone(),
+            &[voter, "replacement"],
+            (1_000, "ujuno"),
+            None,
+            None,
+        )
+        .unwrap();
+    suite
+        .place_vote(&gauge, voter, 0, Some(voter.to_owned()))
+        .unwrap();
+    suite.remove_option(&gauge, owner, 0, voter).unwrap();
+
+    // Updating the member exercises the real CW4 hook against the retained
+    // tombstone. It must neither underflow nor restore the removed index.
+    let changed = suite
+        .force_update_members(
+            vec![],
+            vec![Member {
+                addr: voter.to_owned(),
+                weight: 250,
+            }],
+        )
+        .unwrap();
+    assert_mutation_event(
+        &changed,
+        &[
+            ("action", "member_changed_hook"),
+            ("hook_caller", suite.group_contract.as_str()),
+            ("member_count", "1"),
+            ("member", voter),
+            ("updated_votes", "1"),
+        ],
+    );
+    suite.next_block();
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+
+    suite
+        .place_vote(&gauge, voter, 0, Some("replacement".to_owned()))
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![("replacement".to_owned(), Uint128::new(250))]
+    );
+    let health = suite.query_gauge_health(&gauge, 0).unwrap();
+    assert!(health.consistent);
+    assert_eq!(health.invalid_option_count, 1);
+}
+
+#[test]
+fn removal_handles_zero_and_many_active_voters() {
+    let owner = "owner";
+    let voters = ["voter1", "voter2", "voter3"];
+    let mut suite = SuiteBuilder::new()
+        .with_voting_members(&[(voters[0], 100), (voters[1], 200), (voters[2], 300)])
+        .build();
+
+    suite.next_block();
+    suite
+        .propose_update_proposal_module(voters[0].to_owned(), None)
+        .unwrap();
+    suite.next_block();
+    let proposal = suite.list_proposals().unwrap()[0];
+    for voter in voters {
+        suite.place_vote_single(voter, proposal, Vote::Yes).unwrap();
+    }
+    suite.next_block();
+    suite
+        .execute_single_proposal(voters[0].to_owned(), proposal)
+        .unwrap();
+    let gauge = suite.query_proposal_modules().unwrap()[1].clone();
+    suite
+        .instantiate_adapter_and_create_gauge(
+            gauge.clone(),
+            &["unused", "crowded", "replacement"],
+            (1_000, "ujuno"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Removal with no voter references is immediately safe and non-selectable.
+    suite.remove_option(&gauge, owner, 0, "unused").unwrap();
+
+    // All three voters reference the same option before it is removed.
+    for voter in voters {
+        suite
+            .place_vote(&gauge, voter, 0, Some("crowded".to_owned()))
+            .unwrap();
+    }
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![("crowded".to_owned(), Uint128::new(600))]
+    );
+    suite.remove_option(&gauge, owner, 0, "crowded").unwrap();
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+
+    // Replacing two votes and explicitly abstaining the third drains every
+    // retained reference without underflowing either tally or total cast.
+    for voter in &voters[..2] {
+        suite
+            .place_vote(&gauge, *voter, 0, Some("replacement".to_owned()))
+            .unwrap();
+    }
+    suite.place_vote(&gauge, voters[2], 0, None).unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![("replacement".to_owned(), Uint128::new(300))]
+    );
+    let health = suite.query_gauge_health(&gauge, 0).unwrap();
+    assert!(health.consistent);
+    // The zero-reference removal was deleted immediately; only the formerly
+    // crowded option needs a tombstone until reset.
+    assert_eq!(health.invalid_option_count, 1);
+    assert_eq!(health.total_cast, Uint128::new(300));
+    assert_eq!(health.tally_sum, Uint128::new(300));
 }
 
 fn simple_vote(
@@ -871,7 +1163,358 @@ fn membership_voting_power_change() {
 }
 
 #[test]
-fn token_staking_voting_power_change() {
+fn real_native_staked_module_updates_gauge_through_registered_hook() {
+    let owner = "owner";
+    let voter = "voter";
+    let denom = "ustake";
+    let mut suite = SuiteBuilder::new()
+        .with_voting_members(&[(owner, 1)])
+        .build();
+    suite
+        .app
+        .sudo(SudoMsg::Bank(BankSudo::Mint {
+            to_address: voter.to_owned(),
+            amount: vec![coin(300, denom)],
+        }))
+        .unwrap();
+
+    let voting_code = suite.app.store_code(native_voting_contract());
+    let voting = suite
+        .app
+        .instantiate_contract(
+            voting_code,
+            Addr::unchecked(owner),
+            &dao_voting_token_staked::msg::InstantiateMsg {
+                token_info: dao_voting_token_staked::msg::TokenInfo::Existing {
+                    denom: denom.to_owned(),
+                },
+                unstaking_duration: None,
+                active_threshold: None,
+            },
+            &[],
+            "real native voting module",
+            None,
+        )
+        .unwrap();
+    suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            voting.clone(),
+            &dao_voting_token_staked::msg::ExecuteMsg::Stake {},
+            &[coin(100, denom)],
+        )
+        .unwrap();
+    suite.next_block();
+
+    let gauge = suite
+        .app
+        .instantiate_contract(
+            suite.gauge_code_id,
+            Addr::unchecked(owner),
+            &InstantiateMsg {
+                voting_powers: voting.to_string(),
+                hook_caller: voting.to_string(),
+                owner: owner.to_owned(),
+                gauges: None,
+            },
+            &[],
+            "gauge with real native voting",
+            Some(owner.to_owned()),
+        )
+        .unwrap();
+    suite
+        .app
+        .execute_contract(
+            Addr::unchecked(owner),
+            voting.clone(),
+            &dao_voting_token_staked::msg::ExecuteMsg::AddHook {
+                addr: gauge.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+    suite
+        .instantiate_adapter_and_create_gauge(
+            gauge.clone(),
+            &[voter, "replacement"],
+            (1_000, "ujuno"),
+            None,
+            None,
+        )
+        .unwrap();
+    suite
+        .place_votes(
+            &gauge,
+            voter.to_owned(),
+            0,
+            Some(vec![(voter.to_owned(), Decimal::one())]),
+        )
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![(voter.to_owned(), Uint128::new(100))]
+    );
+
+    let stake_response = suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            voting.clone(),
+            &dao_voting_token_staked::msg::ExecuteMsg::Stake {},
+            &[coin(100, denom)],
+        )
+        .unwrap();
+    assert_mutation_event(
+        &stake_response,
+        &[
+            ("action", "stake_change_hook"),
+            ("kind", "stake"),
+            ("voter", voter),
+            ("amount", "100"),
+            ("updated_votes", "1"),
+        ],
+    );
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![(voter.to_owned(), Uint128::new(200))]
+    );
+
+    suite.remove_option(&gauge, owner, 0, voter).unwrap();
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+
+    let unstake_response = suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            voting,
+            &dao_voting_token_staked::msg::ExecuteMsg::Unstake {
+                amount: Uint128::new(50),
+            },
+            &[],
+        )
+        .unwrap();
+    assert_mutation_event(
+        &unstake_response,
+        &[
+            ("action", "stake_change_hook"),
+            ("kind", "unstake"),
+            ("voter", voter),
+            ("amount", "50"),
+            ("updated_votes", "1"),
+        ],
+    );
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+    suite.next_block();
+    suite
+        .place_vote(&gauge, voter, 0, Some("replacement".to_owned()))
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![("replacement".to_owned(), Uint128::new(150))]
+    );
+}
+
+#[test]
+fn real_cw20_staked_module_updates_gauge_through_registered_hook() {
+    let owner = "owner";
+    let voter = "voter";
+    let mut suite = SuiteBuilder::new()
+        .with_voting_members(&[(owner, 1)])
+        .build();
+
+    let token_code = suite.app.store_code(cw20_contract());
+    let stake_code = suite.app.store_code(cw20_stake_contract());
+    let voting_code = suite.app.store_code(cw20_voting_contract());
+    let token = suite
+        .app
+        .instantiate_contract(
+            token_code,
+            Addr::unchecked(owner),
+            &cw20_base::msg::InstantiateMsg {
+                name: "Voting token".to_owned(),
+                symbol: "VOTE".to_owned(),
+                decimals: 6,
+                initial_balances: vec![cw20::Cw20Coin {
+                    address: voter.to_owned(),
+                    amount: Uint128::new(300),
+                }],
+                mint: None,
+                marketing: None,
+            },
+            &[],
+            "voting token",
+            None,
+        )
+        .unwrap();
+    let staking = suite
+        .app
+        .instantiate_contract(
+            stake_code,
+            Addr::unchecked(owner),
+            &cw20_stake::msg::InstantiateMsg {
+                owner: Some(owner.to_owned()),
+                token_address: token.to_string(),
+                unstaking_duration: None,
+            },
+            &[],
+            "real cw20 staking",
+            None,
+        )
+        .unwrap();
+    let voting = suite
+        .app
+        .instantiate_contract(
+            voting_code,
+            Addr::unchecked(owner),
+            &dao_voting_cw20_staked::msg::InstantiateMsg {
+                token_info: dao_voting_cw20_staked::msg::TokenInfo::Existing {
+                    address: token.to_string(),
+                    staking_contract: dao_voting_cw20_staked::msg::StakingInfo::Existing {
+                        staking_contract_address: staking.to_string(),
+                    },
+                },
+                active_threshold: None,
+            },
+            &[],
+            "real cw20 voting module",
+            None,
+        )
+        .unwrap();
+
+    // Establish voting power before the gauge exists. This stake has no hook
+    // receiver yet and proves subsequent PlaceVotes reads the real module.
+    suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            token.clone(),
+            &cw20::Cw20ExecuteMsg::Send {
+                contract: staking.to_string(),
+                amount: Uint128::new(100),
+                msg: to_json_binary(&cw20_stake::msg::ReceiveMsg::Stake {}).unwrap(),
+            },
+            &[],
+        )
+        .unwrap();
+    suite.next_block();
+
+    let gauge = suite
+        .app
+        .instantiate_contract(
+            suite.gauge_code_id,
+            Addr::unchecked(owner),
+            &InstantiateMsg {
+                voting_powers: voting.to_string(),
+                hook_caller: staking.to_string(),
+                owner: owner.to_owned(),
+                gauges: None,
+            },
+            &[],
+            "gauge with real cw20 voting",
+            Some(owner.to_owned()),
+        )
+        .unwrap();
+    suite
+        .app
+        .execute_contract(
+            Addr::unchecked(owner),
+            staking.clone(),
+            &cw20_stake::msg::ExecuteMsg::AddHook {
+                addr: gauge.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+    suite
+        .instantiate_adapter_and_create_gauge(
+            gauge.clone(),
+            &[voter, "replacement"],
+            (1_000, "ujuno"),
+            None,
+            None,
+        )
+        .unwrap();
+    suite
+        .place_votes(
+            &gauge,
+            voter.to_owned(),
+            0,
+            Some(vec![(voter.to_owned(), Decimal::one())]),
+        )
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![(voter.to_owned(), Uint128::new(100))]
+    );
+
+    // These are real cw20 Send/Unstake calls. cw20-stake emits the hooks; the
+    // test never calls the orchestrator hook entry point directly.
+    let stake_response = suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            token,
+            &cw20::Cw20ExecuteMsg::Send {
+                contract: staking.to_string(),
+                amount: Uint128::new(100),
+                msg: to_json_binary(&cw20_stake::msg::ReceiveMsg::Stake {}).unwrap(),
+            },
+            &[],
+        )
+        .unwrap();
+    assert_mutation_event(
+        &stake_response,
+        &[
+            ("action", "stake_change_hook"),
+            ("kind", "stake"),
+            ("voter", voter),
+            ("amount", "100"),
+            ("updated_votes", "1"),
+        ],
+    );
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![(voter.to_owned(), Uint128::new(200))]
+    );
+
+    suite.remove_option(&gauge, owner, 0, voter).unwrap();
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+
+    let unstake_response = suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            staking,
+            &cw20_stake::msg::ExecuteMsg::Unstake {
+                amount: Uint128::new(50),
+            },
+            &[],
+        )
+        .unwrap();
+    assert_mutation_event(
+        &unstake_response,
+        &[
+            ("action", "stake_change_hook"),
+            ("kind", "unstake"),
+            ("voter", voter),
+            ("amount", "50"),
+            ("updated_votes", "1"),
+        ],
+    );
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+    suite.next_block();
+    suite
+        .place_vote(&gauge, voter, 0, Some("replacement".to_owned()))
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![("replacement".to_owned(), Uint128::new(150))]
+    );
+}
+
+#[test]
+fn synthetic_token_staking_hook_accounting() {
     let voter1 = "voter1";
     let voter2 = "voter2";
     let hook_caller = "token-staking-contract";
@@ -1069,7 +1712,193 @@ fn token_staking_voting_power_change() {
 }
 
 #[test]
-fn nft_staking_voting_power_change() {
+fn real_cw721_staked_module_updates_gauge_through_registered_hook() {
+    let owner = "owner";
+    let voter = "voter";
+    let mut suite = SuiteBuilder::new()
+        .with_voting_members(&[(owner, 1)])
+        .build();
+
+    let nft_code = suite.app.store_code(cw721_contract());
+    let voting_code = suite.app.store_code(cw721_voting_contract());
+    let nft = suite
+        .app
+        .instantiate_contract(
+            nft_code,
+            Addr::unchecked(owner),
+            &cw721_base::msg::InstantiateMsg {
+                name: "Voting NFTs".to_owned(),
+                symbol: "VNFT".to_owned(),
+                minter: owner.to_owned(),
+            },
+            &[],
+            "voting NFTs",
+            None,
+        )
+        .unwrap();
+    for token_id in ["1", "2", "3"] {
+        suite
+            .app
+            .execute_contract(
+                Addr::unchecked(owner),
+                nft.clone(),
+                &cw721_base::msg::ExecuteMsg::<Empty, Empty>::Mint {
+                    token_id: token_id.to_owned(),
+                    owner: voter.to_owned(),
+                    token_uri: None,
+                    extension: Empty {},
+                },
+                &[],
+            )
+            .unwrap();
+    }
+    let voting = suite
+        .app
+        .instantiate_contract(
+            voting_code,
+            Addr::unchecked(owner),
+            &dao_voting_cw721_staked::msg::InstantiateMsg {
+                nft_contract: dao_voting_cw721_staked::msg::NftContract::Existing {
+                    address: nft.to_string(),
+                },
+                unstaking_duration: None,
+                active_threshold: None,
+            },
+            &[],
+            "real cw721 voting module",
+            None,
+        )
+        .unwrap();
+
+    suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            nft.clone(),
+            &cw721_base::msg::ExecuteMsg::<Empty, Empty>::SendNft {
+                contract: voting.to_string(),
+                token_id: "1".to_owned(),
+                msg: to_json_binary(&Empty {}).unwrap(),
+            },
+            &[],
+        )
+        .unwrap();
+    suite.next_block();
+
+    let gauge = suite
+        .app
+        .instantiate_contract(
+            suite.gauge_code_id,
+            Addr::unchecked(owner),
+            &InstantiateMsg {
+                voting_powers: voting.to_string(),
+                hook_caller: voting.to_string(),
+                owner: owner.to_owned(),
+                gauges: None,
+            },
+            &[],
+            "gauge with real cw721 voting",
+            Some(owner.to_owned()),
+        )
+        .unwrap();
+    suite
+        .app
+        .execute_contract(
+            Addr::unchecked(owner),
+            voting.clone(),
+            &dao_voting_cw721_staked::msg::ExecuteMsg::AddHook {
+                addr: gauge.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+    suite
+        .instantiate_adapter_and_create_gauge(
+            gauge.clone(),
+            &[voter, "replacement"],
+            (1_000, "ujuno"),
+            None,
+            None,
+        )
+        .unwrap();
+    suite
+        .place_votes(
+            &gauge,
+            voter.to_owned(),
+            0,
+            Some(vec![(voter.to_owned(), Decimal::one())]),
+        )
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![(voter.to_owned(), Uint128::one())]
+    );
+
+    let stake_response = suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            nft,
+            &cw721_base::msg::ExecuteMsg::<Empty, Empty>::SendNft {
+                contract: voting.to_string(),
+                token_id: "2".to_owned(),
+                msg: to_json_binary(&Empty {}).unwrap(),
+            },
+            &[],
+        )
+        .unwrap();
+    assert_mutation_event(
+        &stake_response,
+        &[
+            ("action", "nft_stake_change_hook"),
+            ("kind", "stake"),
+            ("voter", voter),
+            ("token_id", "2"),
+            ("token_count", "1"),
+            ("updated_votes", "1"),
+        ],
+    );
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![(voter.to_owned(), Uint128::new(2))]
+    );
+
+    suite.remove_option(&gauge, owner, 0, voter).unwrap();
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+
+    let unstake_response = suite
+        .app
+        .execute_contract(
+            Addr::unchecked(voter),
+            voting,
+            &dao_voting_cw721_staked::msg::ExecuteMsg::Unstake {
+                token_ids: vec!["1".to_owned()],
+            },
+            &[],
+        )
+        .unwrap();
+    assert_mutation_event(
+        &unstake_response,
+        &[
+            ("action", "nft_stake_change_hook"),
+            ("kind", "unstake"),
+            ("voter", voter),
+            ("token_count", "1"),
+            ("updated_votes", "1"),
+        ],
+    );
+    assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
+    suite
+        .place_vote(&gauge, voter, 0, Some("replacement".to_owned()))
+        .unwrap();
+    assert_eq!(
+        suite.query_selected_set(&gauge, 0).unwrap(),
+        vec![("replacement".to_owned(), Uint128::one())]
+    );
+}
+
+#[test]
+fn synthetic_nft_staking_hook_accounting() {
     let voter1 = "voter1";
     let voter2 = "voter2";
     let hook_caller = "nft-staking-contract";

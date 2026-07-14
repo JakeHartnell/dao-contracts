@@ -185,6 +185,17 @@ fn add_hook_as_owner(
 
 // ---------------------------------------------------------------- Tests
 
+fn assert_event(response: &cw_multi_test::AppResponse, expected: &[(&str, &str)]) {
+    assert!(response.events.iter().any(|event| {
+        expected.iter().all(|(key, value)| {
+            event
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == *key && attribute.value == *value)
+        })
+    }));
+}
+
 #[test]
 fn add_hook_requires_owner() {
     let (mut suite, gauge_contract, voter) = setup_gauge_and_voter();
@@ -203,6 +214,71 @@ fn add_hook_requires_owner() {
         )
         .unwrap_err();
     assert_eq!(ContractError::Unauthorized {}, err.downcast().unwrap());
+}
+
+#[test]
+fn vote_hook_subscriber_limit_is_enforced_and_capacity_is_reusable() {
+    let (mut suite, gauge_contract, _) = setup_gauge_and_voter();
+    let code = store_recorder(&mut suite);
+    let mut recorders = Vec::new();
+
+    for index in 0..10 {
+        let recorder = instantiate_recorder(&mut suite, code, &format!("recorder-{index}"));
+        let added = add_hook_as_owner(&mut suite, &gauge_contract, &recorder).unwrap();
+        assert_event(
+            &added,
+            &[("action", "add_hook"), ("hook", recorder.as_str())],
+        );
+        recorders.push(recorder);
+    }
+
+    let hooks: GetHooksResponse = suite
+        .app
+        .wrap()
+        .query_wasm_smart(&gauge_contract, &QueryMsg::GetHooks {})
+        .unwrap();
+    assert_eq!(hooks.hooks.len(), 10);
+
+    let eleventh = instantiate_recorder(&mut suite, code, "recorder-10");
+    let err = add_hook_as_owner(&mut suite, &gauge_contract, &eleventh).unwrap_err();
+    assert_eq!(
+        ContractError::TooManyHooks { max: 10 },
+        err.downcast().unwrap()
+    );
+    let hooks: GetHooksResponse = suite
+        .app
+        .wrap()
+        .query_wasm_smart(&gauge_contract, &QueryMsg::GetHooks {})
+        .unwrap();
+    assert_eq!(hooks.hooks.len(), 10);
+    assert!(!hooks.hooks.contains(&eleventh.to_string()));
+
+    let owner = suite.owner.clone();
+    let removed = suite
+        .app
+        .execute_contract(
+            Addr::unchecked(owner),
+            gauge_contract.clone(),
+            &ExecuteMsg::RemoveHook {
+                addr: recorders[0].to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+    assert_event(
+        &removed,
+        &[("action", "remove_hook"), ("hook", recorders[0].as_str())],
+    );
+    add_hook_as_owner(&mut suite, &gauge_contract, &eleventh).unwrap();
+
+    let hooks: GetHooksResponse = suite
+        .app
+        .wrap()
+        .query_wasm_smart(gauge_contract, &QueryMsg::GetHooks {})
+        .unwrap();
+    assert_eq!(hooks.hooks.len(), 10);
+    assert!(!hooks.hooks.contains(&recorders[0].to_string()));
+    assert!(hooks.hooks.contains(&eleventh.to_string()));
 }
 
 #[test]
@@ -243,7 +319,7 @@ fn hook_fires_on_place_votes_with_expected_payload() {
     assert_eq!(hooks.hooks, vec![recorder.to_string()]);
 
     // Place a vote — should fire the hook.
-    suite
+    let response = suite
         .place_votes(
             &gauge_contract,
             voter.clone(),
@@ -251,6 +327,13 @@ fn hook_fires_on_place_votes_with_expected_payload() {
             Some(vec![(voter.clone(), Decimal::percent(90))]),
         )
         .unwrap();
+    assert_event(
+        &response,
+        &[
+            ("action", "vote_hook_succeeded"),
+            ("hook", recorder.as_str()),
+        ],
+    );
 
     let response: LastHookResponse = suite
         .app
@@ -287,7 +370,7 @@ fn hook_fires_on_abstain_with_empty_votes() {
     add_hook_as_owner(&mut suite, &gauge_contract, &recorder).unwrap();
 
     // First cast a real vote so there's something to clear.
-    suite
+    let response = suite
         .place_votes(
             &gauge_contract,
             voter.clone(),
@@ -295,6 +378,13 @@ fn hook_fires_on_abstain_with_empty_votes() {
             Some(vec![(voter.clone(), Decimal::percent(100))]),
         )
         .unwrap();
+    assert_event(
+        &response,
+        &[
+            ("action", "vote_hook_succeeded"),
+            ("hook", recorder.as_str()),
+        ],
+    );
 
     // Then abstain (None ≈ clear my votes).
     suite
@@ -333,7 +423,7 @@ fn failing_hook_is_auto_unregistered_on_place_votes() {
 
     // Place a vote. The failing hook errors → reply runs → it is removed.
     // PlaceVotes itself must still succeed.
-    suite
+    let response = suite
         .place_votes(
             &gauge_contract,
             voter.clone(),
@@ -341,6 +431,20 @@ fn failing_hook_is_auto_unregistered_on_place_votes() {
             Some(vec![(voter.clone(), Decimal::percent(100))]),
         )
         .unwrap();
+    assert_event(
+        &response,
+        &[
+            ("action", "remove_failed_vote_hook"),
+            ("hook", failing.as_str()),
+        ],
+    );
+    assert_event(
+        &response,
+        &[
+            ("action", "vote_hook_succeeded"),
+            ("hook", recorder.as_str()),
+        ],
+    );
 
     // Failing hook is gone, recorder still there.
     let hooks: GetHooksResponse = suite
@@ -360,4 +464,54 @@ fn failing_hook_is_auto_unregistered_on_place_votes() {
         response.hook.is_some(),
         "recorder should still observe votes"
     );
+}
+
+#[test]
+fn multiple_failing_hooks_remove_only_their_stable_addresses() {
+    let (mut suite, gauge_contract, voter) = setup_gauge_and_voter();
+    let recorder_code = store_recorder(&mut suite);
+    let failing_code = store_failing(&mut suite);
+    let healthy_first = instantiate_recorder(&mut suite, recorder_code, "healthy-first");
+    let failing_first = instantiate_recorder(&mut suite, failing_code, "failing-first");
+    let healthy_middle = instantiate_recorder(&mut suite, recorder_code, "healthy-middle");
+    let failing_middle = instantiate_recorder(&mut suite, failing_code, "failing-middle");
+    let failing_last = instantiate_recorder(&mut suite, failing_code, "failing-last");
+
+    for hook in [
+        &healthy_first,
+        &failing_first,
+        &healthy_middle,
+        &failing_middle,
+        &failing_last,
+    ] {
+        add_hook_as_owner(&mut suite, &gauge_contract, hook).unwrap();
+    }
+
+    suite
+        .place_votes(
+            &gauge_contract,
+            voter.clone(),
+            0,
+            Some(vec![(voter, Decimal::one())]),
+        )
+        .unwrap();
+
+    let hooks: GetHooksResponse = suite
+        .app
+        .wrap()
+        .query_wasm_smart(&gauge_contract, &QueryMsg::GetHooks {})
+        .unwrap();
+    assert_eq!(
+        hooks.hooks,
+        vec![healthy_first.to_string(), healthy_middle.to_string()]
+    );
+
+    for healthy in [healthy_first, healthy_middle] {
+        let response: LastHookResponse = suite
+            .app
+            .wrap()
+            .query_wasm_smart(healthy, &RecorderQueryMsg::Last {})
+            .unwrap();
+        assert!(response.hook.is_some());
+    }
 }
