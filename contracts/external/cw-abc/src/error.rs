@@ -34,6 +34,9 @@ pub enum ContractError {
     #[error("Hatch raise cap exceeded: maximum {max}, attempted reserve {attempted}")]
     InitialRaiseCapExceeded { max: Uint128, attempted: Uint128 },
 
+    #[error("Active Hatch reserve {reserve} has already reached or exceeded raise cap {max}")]
+    HatchRaiseCapAlreadyReached { max: Uint128, reserve: Uint128 },
+
     #[error("Execution deadline {deadline} has expired at {now}")]
     DeadlineExpired { deadline: u64, now: u64 },
 

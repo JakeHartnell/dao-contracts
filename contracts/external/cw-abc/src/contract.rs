@@ -253,7 +253,18 @@ pub fn migrate(deps: DepsMut, env: Env, _msg: MigrateMsg) -> Result<Response, Co
     let curve_type = CURVE_TYPE.load(deps.storage)?;
     let curve_state = CURVE_STATE.load(deps.storage)?;
     curve_type.validate(curve_state.decimals, MAX_SUPPLY.may_load(deps.storage)?)?;
-    PHASE_CONFIG.load(deps.storage)?.validate()?;
+    let phase_config = PHASE_CONFIG.load(deps.storage)?;
+    phase_config.validate()?;
+    let phase = PHASE.load(deps.storage)?;
+
+    if matches!(&phase, CommonsPhase::Hatch)
+        && curve_state.reserve >= phase_config.hatch.initial_raise.max
+    {
+        return Err(ContractError::HatchRaiseCapAlreadyReached {
+            max: phase_config.hatch.initial_raise.max,
+            reserve: curve_state.reserve,
+        });
+    }
 
     let total_hatch_contributions =
         if let Some(total) = TOTAL_HATCH_CONTRIBUTIONS.may_load(deps.storage)? {
@@ -275,7 +286,7 @@ pub fn migrate(deps: DepsMut, env: Env, _msg: MigrateMsg) -> Result<Response, Co
             total
         };
 
-    if matches!(PHASE.load(deps.storage)?, CommonsPhase::Hatch) {
+    if matches!(&phase, CommonsPhase::Hatch) {
         let retained = deps
             .querier
             .query_balance(env.contract.address, curve_state.reserve_denom)?;

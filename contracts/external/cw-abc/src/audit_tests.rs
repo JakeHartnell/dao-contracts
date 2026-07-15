@@ -209,6 +209,29 @@ fn migrate_rejects_insolvent_active_hatch() {
     assert!(contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).is_err());
 }
 
+#[test]
+fn migrate_rejects_active_hatch_already_at_raise_cap() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+
+    let mut curve_state = CURVE_STATE.load(&deps.storage).unwrap();
+    curve_state.reserve = Uint128::new(100);
+    CURVE_STATE.save(&mut deps.storage, &curve_state).unwrap();
+
+    let mut config = PHASE_CONFIG.load(&deps.storage).unwrap();
+    config.hatch.initial_raise = MinMax {
+        min: Uint128::one(),
+        max: Uint128::new(100),
+    };
+    PHASE_CONFIG.save(&mut deps.storage, &config).unwrap();
+
+    assert!(matches!(
+        contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}),
+        Err(ContractError::HatchRaiseCapAlreadyReached { max, reserve })
+            if max == Uint128::new(100) && reserve == Uint128::new(100)
+    ));
+}
+
 // ============================================================
 // C-1: update_curve rejection
 // ============================================================
