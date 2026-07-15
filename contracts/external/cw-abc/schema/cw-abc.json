@@ -696,6 +696,30 @@
         "properties": {
           "buy": {
             "type": "object",
+            "properties": {
+              "deadline": {
+                "description": "Optional latest accepted block time. Equality is accepted.",
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/Timestamp"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "min_tokens": {
+                "description": "Optional minimum supply tokens that must be minted.",
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/Uint128"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
             "additionalProperties": false
           }
         },
@@ -710,6 +734,30 @@
         "properties": {
           "sell": {
             "type": "object",
+            "properties": {
+              "deadline": {
+                "description": "Optional latest accepted block time. Equality is accepted.",
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/Timestamp"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "min_reserve": {
+                "description": "Optional minimum reserve tokens that must be returned.",
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/Uint128"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
             "additionalProperties": false
           }
         },

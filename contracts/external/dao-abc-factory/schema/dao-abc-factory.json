@@ -6,7 +6,49 @@
     "$schema": "http://json-schema.org/draft-07/schema#",
     "title": "InstantiateMsg",
     "type": "object",
-    "additionalProperties": false
+    "required": [
+      "approved_abc",
+      "approved_token_issuers"
+    ],
+    "properties": {
+      "approved_abc": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/ApprovedCode"
+        }
+      },
+      "approved_token_issuers": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/ApprovedCode"
+        }
+      }
+    },
+    "additionalProperties": false,
+    "definitions": {
+      "ApprovedCode": {
+        "type": "object",
+        "required": [
+          "checksum",
+          "code_id"
+        ],
+        "properties": {
+          "checksum": {
+            "$ref": "#/definitions/Binary"
+          },
+          "code_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "additionalProperties": false
+      },
+      "Binary": {
+        "description": "Binary is a wrapper around Vec<u8> to add base64 de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is only needed as serde-json-{core,wasm} has a horrible encoding for Vec<u8>. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+        "type": "string"
+      }
+    }
   },
   "execute": {
     "$schema": "http://json-schema.org/draft-07/schema#",

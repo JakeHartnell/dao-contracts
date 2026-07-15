@@ -17,7 +17,7 @@ use crate::abc::{CommonsPhase, CurveType, MinMax, VestingSchedule};
 use crate::commands;
 use crate::commands::insert_into_priority_queue;
 use crate::contract;
-use crate::msg::{InstantiateMsg, UpdatePhaseConfigMsg};
+use crate::msg::{InstantiateMsg, MigrateMsg, UpdatePhaseConfigMsg};
 use crate::state::{
     HatcherAllowlistConfig, HatcherAllowlistConfigType, HatcherAllowlistEntry, HatcherState,
     RefundSnapshot, CURVE_STATE, HATCHERS, PHASE, REFUND_SNAPSHOT, SUPPLY_DENOM,
@@ -91,6 +91,65 @@ fn curve_validation_rejects_sigmoid_without_bounded_domain() {
         mock_init(deps.as_mut(), msg),
         Err(ContractError::InvalidCurve { .. })
     ));
+}
+
+#[test]
+fn update_max_supply_revalidates_stored_sigmoid_domain() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.supply.max_supply = Some(Uint128::new(10));
+    msg.curve_type = CurveType::Sigmoid {
+        amplitude: Uint128::one(),
+        amplitude_scale: 0,
+        steepness_num: 1,
+        steepness_den: 1,
+        midpoint: Uint128::zero(),
+        midpoint_scale: 0,
+    };
+    mock_init(deps.as_mut(), msg).unwrap();
+
+    assert!(matches!(
+        commands::update_max_supply(
+            deps.as_mut(),
+            mock_info(TEST_CREATOR, &[]),
+            Some(Uint128::new(3100)),
+        ),
+        Err(ContractError::InvalidCurve { .. })
+    ));
+}
+
+#[test]
+fn migrate_reconstructs_missing_hatch_contribution_aggregate() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
+    HATCHERS
+        .save(
+            &mut deps.storage,
+            &Addr::unchecked("one"),
+            &HatcherState {
+                contributed: Uint128::new(3),
+                ..HatcherState::default()
+            },
+        )
+        .unwrap();
+    HATCHERS
+        .save(
+            &mut deps.storage,
+            &Addr::unchecked("two"),
+            &HatcherState {
+                contributed: Uint128::new(4),
+                ..HatcherState::default()
+            },
+        )
+        .unwrap();
+
+    contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
+
+    assert_eq!(
+        TOTAL_HATCH_CONTRIBUTIONS.load(&deps.storage).unwrap(),
+        Uint128::new(7)
+    );
 }
 
 // ============================================================

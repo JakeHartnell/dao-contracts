@@ -1,8 +1,8 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Reply, Response, StdResult, SubMsg,
-    Uint128, WasmMsg,
+    to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Order, Reply, Response, StdResult,
+    SubMsg, Uint128, WasmMsg,
 };
 use cw2::set_contract_version;
 use cw_curves::DecimalPlaces;
@@ -15,8 +15,9 @@ use crate::abc::{CommonsPhase, CurveFn};
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 use crate::state::{
-    CurveState, CURVE_STATE, CURVE_TYPE, FUNDING_POOL_FORWARDING, IS_PAUSED, MAX_SUPPLY, PHASE,
-    PHASE_CONFIG, SUPPLY_DENOM, TEMP_SUPPLY, TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
+    CurveState, CURVE_STATE, CURVE_TYPE, FUNDING_POOL_FORWARDING, HATCHERS, IS_PAUSED, MAX_SUPPLY,
+    PHASE, PHASE_CONFIG, SUPPLY_DENOM, TEMP_SUPPLY, TOKEN_ISSUER_CONTRACT,
+    TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::{commands, queries};
 
@@ -247,6 +248,22 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
             expected: CONTRACT_NAME.to_string(),
             actual: stored.contract,
         });
+    }
+
+    if !TOTAL_HATCH_CONTRIBUTIONS.exists(deps.storage) {
+        // Older versions tracked only per-address contributions. Reconstruct
+        // the aggregate once during migration so all subsequent buys and
+        // lifecycle transitions remain O(1).
+        let total = HATCHERS
+            .range(deps.storage, None, None, Order::Ascending)
+            .try_fold(
+                Uint128::zero(),
+                |acc, item| -> Result<Uint128, ContractError> {
+                    let (_, hatcher) = item?;
+                    Ok(acc.checked_add(hatcher.contributed)?)
+                },
+            )?;
+        TOTAL_HATCH_CONTRIBUTIONS.save(deps.storage, &total)?;
     }
 
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;

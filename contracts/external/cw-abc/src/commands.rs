@@ -687,6 +687,13 @@ pub fn update_max_supply(
 ) -> Result<Response, ContractError> {
     cw_ownable::assert_owner(deps.storage, &info.sender)?;
 
+    // The maximum supply is part of the validated numeric domain for curves
+    // such as Sigmoid. Revalidate before mutating storage so an owner cannot
+    // turn a previously safe curve into a permanently unusable one.
+    let curve_type = CURVE_TYPE.load(deps.storage)?;
+    let curve_state = CURVE_STATE.load(deps.storage)?;
+    curve_type.validate(curve_state.decimals, max_supply)?;
+
     match max_supply {
         Some(max) => MAX_SUPPLY.save(deps.storage, &max)?,
         None => MAX_SUPPLY.remove(deps.storage),
