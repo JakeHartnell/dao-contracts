@@ -144,7 +144,10 @@ fn mutation_events_expose_stable_indexer_fields() {
             ("action", "reset_gauge"),
             ("sender", keeper),
             ("gauge_id", "0"),
-            ("processed", "1"),
+            // Reset also performs the bounded garbage collection that makes
+            // retained removal tombstones safe to delete. `temporary` and the
+            // active voter option are therefore both processed in this batch.
+            ("processed", "2"),
             ("complete", "true"),
         ],
     );

@@ -469,7 +469,8 @@ fn removal_handles_zero_and_many_active_voters() {
         )
         .unwrap();
 
-    // Removal with no voter references is immediately safe and non-selectable.
+    // Even a zero tally must be tombstoned: the aggregate does not prove that
+    // no stored zero-power vote references the option and could later restake.
     suite.remove_option(&gauge, owner, 0, "unused").unwrap();
 
     // All three voters reference the same option before it is removed.
@@ -499,9 +500,9 @@ fn removal_handles_zero_and_many_active_voters() {
     );
     let health = suite.query_gauge_health(&gauge, 0).unwrap();
     assert!(health.consistent);
-    // The zero-reference removal was deleted immediately; only the formerly
-    // crowded option needs a tombstone until reset.
-    assert_eq!(health.invalid_option_count, 1);
+    // Both removals remain tombstoned until reset. This bounded cleanup point
+    // is what proves any old voter records are expired before deleting them.
+    assert_eq!(health.invalid_option_count, 2);
     assert_eq!(health.total_cast, Uint128::new(300));
     assert_eq!(health.tally_sum, Uint128::new(300));
 }

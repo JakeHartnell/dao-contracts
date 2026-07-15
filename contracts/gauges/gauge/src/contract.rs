@@ -79,6 +79,305 @@ mod health_query_tests {
         from_json, to_json_binary, BankMsg, ContractResult, CosmosMsg, SystemResult, WasmQuery,
     };
 
+    fn test_gauge(reset: Option<Reset>) -> Gauge {
+        Gauge {
+            title: "regression".to_owned(),
+            adapter: Addr::unchecked("adapter"),
+            epoch: 600,
+            min_percent_selected: None,
+            max_options_selected: 10,
+            max_available_percentage: None,
+            is_stopped: false,
+            next_epoch: 1_000,
+            last_executed_set: None,
+            reset,
+        }
+    }
+
+    fn test_config(hook_caller: &Addr) -> Config {
+        Config {
+            voting_powers: Addr::unchecked("voting-powers"),
+            hook_caller: hook_caller.clone(),
+            owner: Addr::unchecked("owner"),
+            dao_core: Addr::unchecked("dao"),
+        }
+    }
+
+    #[test]
+    fn due_reset_rejects_same_deadline_and_delayed_replacement_without_corrupting_hooks() {
+        use crate::state::{Vote, WeightedVotes};
+        use cw4::MemberDiff;
+
+        const GAUGE_ID: u64 = 7;
+        const RESET_DEADLINE: u64 = 10_000;
+
+        for now in [RESET_DEADLINE, RESET_DEADLINE + 500] {
+            let mut deps = mock_dependencies();
+            let mut env = mock_env();
+            env.block.time = cosmwasm_std::Timestamp::from_seconds(now);
+            let voter = Addr::unchecked("alice");
+            let hook = Addr::unchecked("membership-hook");
+            CONFIG
+                .save(deps.as_mut().storage, &test_config(&hook))
+                .unwrap();
+            GAUGES
+                .save(
+                    deps.as_mut().storage,
+                    GAUGE_ID,
+                    &test_gauge(Some(Reset {
+                        last: None,
+                        reset_each: 100,
+                        next: RESET_DEADLINE,
+                    })),
+                )
+                .unwrap();
+            for option in ["old", "replacement"] {
+                update_tally(deps.as_mut().storage, GAUGE_ID, option, 0, 0).unwrap();
+            }
+            update_tally(deps.as_mut().storage, GAUGE_ID, "old", 0, 100).unwrap();
+            votes()
+                .save(
+                    deps.as_mut().storage,
+                    &voter,
+                    GAUGE_ID,
+                    &WeightedVotes {
+                        gauge_id: GAUGE_ID,
+                        power: Uint128::new(100),
+                        votes: vec![Vote {
+                            option: "old".to_owned(),
+                            weight: Decimal::one(),
+                        }],
+                        cast: Some(RESET_DEADLINE - 1),
+                    },
+                )
+                .unwrap();
+            deps.querier.update_wasm(|_| {
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&VotingPowerAtHeightResponse {
+                        power: Uint128::new(200),
+                        height: 1,
+                    })
+                    .unwrap(),
+                ))
+            });
+
+            assert_eq!(
+                execute::place_votes(
+                    deps.as_mut(),
+                    env,
+                    voter.clone(),
+                    GAUGE_ID,
+                    Some(vec![Vote {
+                        option: "replacement".to_owned(),
+                        weight: Decimal::one(),
+                    }]),
+                )
+                .unwrap_err(),
+                ContractError::GaugeResetting(GAUGE_ID),
+                "now={now}"
+            );
+            assert_eq!(
+                TALLY
+                    .load(deps.as_ref().storage, (GAUGE_ID, "old"))
+                    .unwrap(),
+                100
+            );
+            assert_eq!(
+                TALLY
+                    .load(deps.as_ref().storage, (GAUGE_ID, "replacement"))
+                    .unwrap(),
+                0
+            );
+
+            execute::member_changed(
+                deps.as_mut(),
+                hook,
+                vec![MemberDiff {
+                    key: voter.to_string(),
+                    old: Some(100),
+                    new: Some(150),
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                TALLY
+                    .load(deps.as_ref().storage, (GAUGE_ID, "old"))
+                    .unwrap(),
+                150
+            );
+            assert_eq!(
+                TALLY
+                    .load(deps.as_ref().storage, (GAUGE_ID, "replacement"))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn removing_zero_tally_tombstones_option_across_restake() {
+        use crate::state::{Vote, WeightedVotes};
+        use dao_hooks::stake::StakeChangedHookMsg;
+
+        const GAUGE_ID: u64 = 7;
+        let mut deps = mock_dependencies();
+        let hook = Addr::unchecked("staking-hook");
+        let voter = Addr::unchecked("alice");
+        CONFIG
+            .save(deps.as_mut().storage, &test_config(&hook))
+            .unwrap();
+        GAUGES
+            .save(deps.as_mut().storage, GAUGE_ID, &test_gauge(None))
+            .unwrap();
+        update_tally(deps.as_mut().storage, GAUGE_ID, "removed", 0, 0).unwrap();
+        votes()
+            .save(
+                deps.as_mut().storage,
+                &voter,
+                GAUGE_ID,
+                &WeightedVotes {
+                    gauge_id: GAUGE_ID,
+                    power: Uint128::zero(),
+                    votes: vec![Vote {
+                        option: "removed".to_owned(),
+                        weight: Decimal::one(),
+                    }],
+                    cast: Some(mock_env().block.time.seconds()),
+                },
+            )
+            .unwrap();
+
+        execute::remove_option(
+            deps.as_mut(),
+            Addr::unchecked("owner"),
+            GAUGE_ID,
+            "removed".to_owned(),
+        )
+        .unwrap();
+        assert!(TALLY.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
+        assert!(INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
+
+        execute::stake_changed(
+            deps.as_mut(),
+            MessageInfo {
+                sender: hook,
+                funds: vec![],
+            },
+            StakeChangedHookMsg::Stake {
+                addr: voter,
+                amount: Uint128::new(50),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            TALLY
+                .load(deps.as_ref().storage, (GAUGE_ID, "removed"))
+                .unwrap(),
+            50
+        );
+        assert!(INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
+        assert!(!OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 50, "removed")));
+    }
+
+    #[test]
+    fn expired_votes_skip_checked_power_arithmetic_in_all_stake_hooks() {
+        use crate::state::{Vote, WeightedVotes};
+        use dao_hooks::{nft_stake::NftStakeChangedHookMsg, stake::StakeChangedHookMsg};
+
+        let mut deps = mock_dependencies();
+        let hook = Addr::unchecked("staking-hook");
+        CONFIG
+            .save(deps.as_mut().storage, &test_config(&hook))
+            .unwrap();
+
+        let cases = [
+            (1u64, "fungible-stake", Uint128::MAX),
+            (2, "fungible-unstake", Uint128::zero()),
+            (3, "nft-stake", Uint128::MAX),
+            (4, "nft-unstake", Uint128::zero()),
+        ];
+        for (gauge_id, voter, power) in cases {
+            GAUGES
+                .save(
+                    deps.as_mut().storage,
+                    gauge_id,
+                    &test_gauge(Some(Reset {
+                        last: Some(100),
+                        reset_each: 100,
+                        next: 200,
+                    })),
+                )
+                .unwrap();
+            votes()
+                .save(
+                    deps.as_mut().storage,
+                    &Addr::unchecked(voter),
+                    gauge_id,
+                    &WeightedVotes {
+                        gauge_id,
+                        power,
+                        votes: vec![Vote {
+                            option: "stale".to_owned(),
+                            weight: Decimal::one(),
+                        }],
+                        cast: Some(99),
+                    },
+                )
+                .unwrap();
+        }
+
+        let info = MessageInfo {
+            sender: hook,
+            funds: vec![],
+        };
+        execute::stake_changed(
+            deps.as_mut(),
+            info.clone(),
+            StakeChangedHookMsg::Stake {
+                addr: Addr::unchecked("fungible-stake"),
+                amount: Uint128::one(),
+            },
+        )
+        .unwrap();
+        execute::stake_changed(
+            deps.as_mut(),
+            info.clone(),
+            StakeChangedHookMsg::Unstake {
+                addr: Addr::unchecked("fungible-unstake"),
+                amount: Uint128::one(),
+            },
+        )
+        .unwrap();
+        execute::nft_stake_changed(
+            deps.as_mut(),
+            info.clone(),
+            NftStakeChangedHookMsg::Stake {
+                addr: Addr::unchecked("nft-stake"),
+                token_id: "nft".to_owned(),
+            },
+        )
+        .unwrap();
+        execute::nft_stake_changed(
+            deps.as_mut(),
+            info,
+            NftStakeChangedHookMsg::Unstake {
+                addr: Addr::unchecked("nft-unstake"),
+                token_ids: vec!["nft".to_owned()],
+            },
+        )
+        .unwrap();
+
+        for (gauge_id, voter, power) in cases {
+            assert_eq!(
+                votes()
+                    .load(deps.as_ref().storage, &Addr::unchecked(voter), gauge_id)
+                    .unwrap()
+                    .power,
+                power
+            );
+        }
+    }
+
     #[test]
     fn gauge_health_reports_and_then_clears_index_mismatch() {
         let mut deps = mock_dependencies();
@@ -981,6 +1280,10 @@ mod execute {
                 for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
+                    if vote.is_expired(&gauge) {
+                        continue;
+                    }
+
                     let old = vote.power;
 
                     // Voting power increases with staking amount
@@ -989,10 +1292,6 @@ mod execute {
                             voter: addr.to_string(),
                         }
                     })?;
-
-                    if vote.is_expired(&gauge) {
-                        continue;
-                    }
 
                     // calculate updates and adjust tallies
                     let updates: Vec<_> = vote
@@ -1029,6 +1328,10 @@ mod execute {
                 for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
+                    if vote.is_expired(&gauge) {
+                        continue;
+                    }
+
                     let old = vote.power;
 
                     // Decrease voting power by unstaked amount
@@ -1037,10 +1340,6 @@ mod execute {
                             voter: addr.to_string(),
                         }
                     })?;
-
-                    if vote.is_expired(&gauge) {
-                        continue;
-                    }
 
                     // calculate updates and adjust tallies
                     let updates: Vec<_> = vote
@@ -1091,6 +1390,10 @@ mod execute {
                 for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
+                    if vote.is_expired(&gauge) {
+                        continue;
+                    }
+
                     let old = vote.power;
                     // Voting power increases by one (only one token_id staked at a time)
                     let new = vote.power.checked_add(Uint128::one()).map_err(|_| {
@@ -1098,10 +1401,6 @@ mod execute {
                             voter: addr.to_string(),
                         }
                     })?;
-
-                    if vote.is_expired(&gauge) {
-                        continue;
-                    }
 
                     // calculate updates and adjust tallies
                     let updates: Vec<_> = vote
@@ -1146,6 +1445,10 @@ mod execute {
                 for mut vote in votes().power_change_votes(deps.as_ref(), &addr)? {
                     let gauge = GAUGES.load(deps.storage, vote.gauge_id)?;
 
+                    if vote.is_expired(&gauge) {
+                        continue;
+                    }
+
                     let old = vote.power;
 
                     // Decrease voting power by number of token_ids.
@@ -1156,10 +1459,6 @@ mod execute {
                             voter: addr.to_string(),
                         }
                     })?;
-
-                    if vote.is_expired(&gauge) {
-                        continue;
-                    }
 
                     // calculate updates and adjust tallies
                     let updates: Vec<_> = vote
@@ -1465,11 +1764,10 @@ mod execute {
 
         let points = TALLY.load(deps.storage, (gauge_id, &option))?;
         OPTION_BY_POINTS.remove(deps.storage, (gauge_id, points, &option));
-        if points == 0 {
-            TALLY.remove(deps.storage, (gauge_id, &option));
-        } else {
-            INVALID_OPTIONS.save(deps.storage, (gauge_id, &option), &true)?;
-        }
+        // A zero tally does not prove that no stored zero-power vote still
+        // references this option. Retain both the tally and tombstone until
+        // reset's bounded cleanup so a later power increase cannot reactivate it.
+        INVALID_OPTIONS.save(deps.storage, (gauge_id, &option), &true)?;
 
         Ok(Response::new()
             .add_attribute("action", "remove_option")
@@ -1697,7 +1995,15 @@ mod execute {
             return Err(ContractError::GaugeStopped(gauge_id));
         }
 
-        if gauge.is_resetting() {
+        // Once the reset deadline is reached, no vote may be accepted until a
+        // keeper completes reset and advances `next`. Otherwise a delayed
+        // reset would erase votes cast in the gap before its first batch.
+        let reset_due = gauge
+            .reset
+            .as_ref()
+            .map(|reset| reset.next <= env.block.time.seconds())
+            .unwrap_or_default();
+        if reset_due || gauge.is_resetting() {
             return Err(ContractError::GaugeResetting(gauge_id));
         }
 
