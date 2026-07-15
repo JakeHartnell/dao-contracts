@@ -9,7 +9,98 @@ use crate::{
     Curve, DecimalPlaces,
 };
 use rust_decimal::Decimal;
-use std::str::FromStr;
+use std::{panic::catch_unwind, str::FromStr};
+
+fn result_without_panic<T>(
+    operation: impl FnOnce() -> Result<T, crate::CurveError>,
+) -> Result<T, crate::CurveError> {
+    catch_unwind(std::panic::AssertUnwindSafe(operation)).expect("curve arithmetic must not panic")
+}
+
+fn assert_overflow_without_panic<T>(operation: impl FnOnce() -> Result<T, crate::CurveError>) {
+    assert!(matches!(
+        result_without_panic(operation),
+        Err(crate::CurveError::Overflow { .. })
+    ));
+}
+
+fn max_decimal_uint() -> Uint128 {
+    Uint128::new(Decimal::MAX.mantissa() as u128)
+}
+
+#[test]
+fn constant_boundaries_return_errors_without_panicking() {
+    let max_curve = Constant::new(Decimal::MAX, DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| max_curve.spot_price(Uint128::MAX));
+    assert_overflow_without_panic(|| max_curve.reserve(Uint128::new(2)));
+
+    let tiny_curve = Constant::new(Decimal::new(1, 28), DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| tiny_curve.supply(max_decimal_uint()));
+}
+
+#[test]
+fn linear_boundaries_return_errors_without_panicking() {
+    let curve = Linear::new(Decimal::MAX, DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| curve.spot_price(Uint128::new(2)));
+    assert_overflow_without_panic(|| curve.reserve(max_decimal_uint()));
+
+    let tiny_curve = Linear::new(Decimal::new(1, 28), DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| tiny_curve.supply(Uint128::new(1)));
+}
+
+#[test]
+fn square_root_boundaries_return_errors_without_panicking() {
+    let curve = SquareRoot::new(Decimal::MAX, DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| curve.spot_price(Uint128::new(4)));
+    assert_overflow_without_panic(|| curve.reserve(Uint128::new(2)));
+
+    let inverse_curve = SquareRoot::new(Decimal::ONE, DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| inverse_curve.supply(max_decimal_uint()));
+}
+
+#[test]
+fn power_boundaries_return_errors_without_panicking() {
+    // Reviewer regression: 16/16 is accepted (total work 32), and a slope
+    // near Decimal::MAX must be rejected by every overflowing operation.
+    let slope = Decimal::MAX - Decimal::ONE;
+    let curve = Power::new(slope, 16, 16, DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| curve.spot_price(Uint128::new(2)));
+    assert_overflow_without_panic(|| curve.reserve(Uint128::new(2)));
+    assert_overflow_without_panic(|| curve.supply(Uint128::new(1)));
+
+    let max_supply_curve = Power::new(Decimal::ONE, 1, 1, DecimalPlaces::new(0, 0));
+    assert_overflow_without_panic(|| max_supply_curve.reserve(max_decimal_uint()));
+}
+
+#[test]
+fn sigmoid_boundaries_return_errors_without_panicking() {
+    let steep_curve = Sigmoid::new(
+        Decimal::ONE,
+        Decimal::MAX,
+        Decimal::ZERO,
+        DecimalPlaces::new(0, 0),
+    );
+    assert_overflow_without_panic(|| steep_curve.spot_price(Uint128::new(2)));
+    assert_overflow_without_panic(|| steep_curve.reserve(Uint128::new(2)));
+
+    let inverse_curve = Sigmoid::new(
+        Decimal::MAX,
+        Decimal::ONE,
+        Decimal::ONE,
+        DecimalPlaces::new(0, 0),
+    );
+    assert_overflow_without_panic(|| inverse_curve.supply(max_decimal_uint()));
+}
+
+#[test]
+fn decimal_helpers_return_errors_at_arithmetic_boundaries() {
+    assert_overflow_without_panic(|| crate::utils::square_root(Decimal::MAX));
+    assert_overflow_without_panic(|| crate::utils::cube_root(Decimal::MAX));
+    assert!(matches!(
+        result_without_panic(|| taylor_exp(Decimal::MIN)),
+        Err(crate::CurveError::InvalidConfiguration { .. })
+    ));
+}
 
 #[test]
 fn decimal_rejects_unsupported_scale_and_coefficient_without_panicking() {

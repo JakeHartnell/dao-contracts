@@ -2,7 +2,9 @@ use cosmwasm_std::{Decimal as StdDecimal, Uint128};
 use rust_decimal::Decimal;
 
 use crate::{
-    utils::{decimal_to_std, taylor_exp},
+    utils::{
+        checked_add, checked_div, checked_mul, checked_neg, checked_sub, decimal_to_std, taylor_exp,
+    },
     Curve, CurveError, DecimalPlaces,
 };
 
@@ -55,12 +57,20 @@ impl Sigmoid {
     /// Spot price at normalized supply `s` (Decimal). Inner helper used by
     /// both `spot_price` and the integration / Newton paths.
     fn price_at(&self, s: Decimal) -> Result<Decimal, CurveError> {
-        let exponent = -self.steepness * (s - self.midpoint);
-        let denom = Decimal::ONE + taylor_exp(exponent)?;
+        let offset = checked_sub(s, self.midpoint, "sigmoid supply offset")?;
+        let exponent = checked_neg(
+            checked_mul(self.steepness, offset, "sigmoid exponent")?,
+            "sigmoid negative exponent",
+        )?;
+        let denom = checked_add(
+            Decimal::ONE,
+            taylor_exp(exponent)?,
+            "sigmoid price denominator",
+        )?;
         if denom.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        Ok(self.amplitude / denom)
+        checked_div(self.amplitude, denom, "sigmoid price")
     }
 
     /// Simpson's rule on `[0, supply]` with `panels` (must be even) panels.
@@ -69,25 +79,40 @@ impl Sigmoid {
             return Ok(Decimal::ZERO);
         }
         let panels = if panels % 2 == 0 { panels } else { panels + 1 };
-        let h = supply / Decimal::from(panels);
+        let h = checked_div(supply, Decimal::from(panels), "sigmoid panel width")?;
         // Simpson: (h/3) * (f0 + 4*(f1+f3+f5+...) + 2*(f2+f4+...) + fn)
         let f0 = self.price_at(Decimal::ZERO)?;
         let fn_end = self.price_at(supply)?;
         let mut odd_sum = Decimal::ZERO;
         let mut even_sum = Decimal::ZERO;
         for i in 1..panels {
-            let s = h * Decimal::from(i);
+            let s = checked_mul(h, Decimal::from(i), "sigmoid panel position")?;
             let f = self.price_at(s)?;
             if i % 2 == 1 {
-                odd_sum += f;
+                odd_sum = checked_add(odd_sum, f, "sigmoid odd panel sum")?;
             } else {
-                even_sum += f;
+                even_sum = checked_add(even_sum, f, "sigmoid even panel sum")?;
             }
         }
         let four = Decimal::from(4u32);
         let two = Decimal::from(2u32);
         let three = Decimal::from(3u32);
-        Ok((h / three) * (f0 + four * odd_sum + two * even_sum + fn_end))
+        let weighted_odd = checked_mul(four, odd_sum, "sigmoid weighted odd panels")?;
+        let weighted_even = checked_mul(two, even_sum, "sigmoid weighted even panels")?;
+        let sum = checked_add(
+            checked_add(
+                checked_add(f0, weighted_odd, "sigmoid Simpson f0 and odd")?,
+                weighted_even,
+                "sigmoid Simpson even",
+            )?,
+            fn_end,
+            "sigmoid Simpson endpoint",
+        )?;
+        checked_mul(
+            checked_div(h, three, "sigmoid Simpson panel factor")?,
+            sum,
+            "sigmoid integral",
+        )
     }
 
     pub(crate) fn supply_with_iterations(
@@ -113,13 +138,22 @@ impl Sigmoid {
             if derivative.is_zero() {
                 return Err(CurveError::DivisionByZero);
             }
-            let next = s - (r - target) / derivative;
+            let correction = checked_div(
+                checked_sub(r, target, "sigmoid inverse residual")?,
+                derivative,
+                "sigmoid inverse correction",
+            )?;
+            let next = checked_sub(s, correction, "sigmoid inverse next supply")?;
             let next = if next < Decimal::ZERO {
-                s / Decimal::from(2u32)
+                checked_div(s, Decimal::from(2u32), "sigmoid inverse backoff")?
             } else {
                 next
             };
-            let diff = if next > s { next - s } else { s - next };
+            let diff = if next > s {
+                checked_sub(next, s, "sigmoid inverse positive difference")?
+            } else {
+                checked_sub(s, next, "sigmoid inverse negative difference")?
+            };
             s = next;
             if diff < Decimal::new(1, 9) {
                 return self.normalize.to_supply(s);

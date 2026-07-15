@@ -7,6 +7,58 @@ use std::str::FromStr;
 
 use crate::CurveError;
 
+fn arithmetic_overflow(operation: &str, value: Decimal) -> CurveError {
+    CurveError::Overflow {
+        scale: value.scale(),
+        value: format!("{operation}: {value}"),
+    }
+}
+
+pub(crate) fn checked_add(
+    lhs: Decimal,
+    rhs: Decimal,
+    operation: &str,
+) -> Result<Decimal, CurveError> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| arithmetic_overflow(operation, lhs))
+}
+
+pub(crate) fn checked_sub(
+    lhs: Decimal,
+    rhs: Decimal,
+    operation: &str,
+) -> Result<Decimal, CurveError> {
+    lhs.checked_sub(rhs)
+        .ok_or_else(|| arithmetic_overflow(operation, lhs))
+}
+
+pub(crate) fn checked_mul(
+    lhs: Decimal,
+    rhs: Decimal,
+    operation: &str,
+) -> Result<Decimal, CurveError> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| arithmetic_overflow(operation, lhs))
+}
+
+pub(crate) fn checked_div(
+    lhs: Decimal,
+    rhs: Decimal,
+    operation: &str,
+) -> Result<Decimal, CurveError> {
+    if rhs.is_zero() {
+        return Err(CurveError::DivisionByZero);
+    }
+    lhs.checked_div(rhs)
+        .ok_or_else(|| arithmetic_overflow(operation, lhs))
+}
+
+pub(crate) fn checked_neg(value: Decimal, operation: &str) -> Result<Decimal, CurveError> {
+    Decimal::ZERO
+        .checked_sub(value)
+        .ok_or_else(|| arithmetic_overflow(operation, value))
+}
+
 /// decimal returns an object = num * 10 ^ -scale
 /// We use this function in contract.rs rather than call the crate constructor
 /// itself, in case we want to swap out the implementation, we can do it only in this file.
@@ -54,7 +106,7 @@ pub(crate) fn square_root(square: Decimal) -> Result<Decimal, CurveError> {
     const EXTRA_DIGITS: u32 = 12;
     let multiplier = 10u128.saturating_pow(EXTRA_DIGITS);
 
-    let extended = square * decimal(multiplier, 0);
+    let extended = checked_mul(square, decimal(multiplier, 0), "square_root scaling")?;
     let extended = extended.floor().to_u128().ok_or(CurveError::Overflow {
         scale: EXTRA_DIGITS,
         value: square.to_string(),
@@ -73,7 +125,7 @@ pub(crate) fn cube_root(cube: Decimal) -> Result<Decimal, CurveError> {
     const EXTRA_DIGITS: u32 = 15;
     let multiplier = 10u128.saturating_pow(EXTRA_DIGITS);
 
-    let extended = cube * decimal(multiplier, 0);
+    let extended = checked_mul(cube, decimal(multiplier, 0), "cube_root scaling")?;
     let extended = extended.floor().to_u128().ok_or(CurveError::Overflow {
         scale: EXTRA_DIGITS,
         value: cube.to_string(),
@@ -152,19 +204,28 @@ pub(crate) fn nth_root(value: Decimal, n: u32) -> Result<Decimal, CurveError> {
         }
         if overflow || x_pow.is_zero() {
             // Halve x and retry — gets us back to a safe range.
-            x /= Decimal::from(2u32);
+            x = checked_div(x, Decimal::from(2u32), "nth_root retry")?;
             if x.is_zero() {
                 return Err(CurveError::DivisionByZero);
             }
             continue;
         }
-        let quotient = value / x_pow;
-        let next = (n_minus_1_dec * x + quotient) / n_dec;
-        let diff = if next > x { next - x } else { x - next };
+        let quotient = checked_div(value, x_pow, "nth_root quotient")?;
+        let weighted = checked_mul(n_minus_1_dec, x, "nth_root weighted guess")?;
+        let next = checked_div(
+            checked_add(weighted, quotient, "nth_root numerator")?,
+            n_dec,
+            "nth_root next guess",
+        )?;
+        let diff = if next > x {
+            checked_sub(next, x, "nth_root positive difference")?
+        } else {
+            checked_sub(x, next, "nth_root negative difference")?
+        };
         let tol = if x.is_zero() {
             Decimal::new(1, 9)
         } else {
-            x * Decimal::new(1, 9)
+            checked_mul(x, Decimal::new(1, 9), "nth_root tolerance")?
         };
         x = next;
         if diff <= tol {
@@ -249,7 +310,11 @@ pub(crate) fn taylor_exp(x: Decimal) -> Result<Decimal, CurveError> {
     if x.is_zero() {
         return Ok(Decimal::ONE);
     }
-    let abs = if x.is_sign_negative() { -x } else { x };
+    let abs = if x.is_sign_negative() {
+        checked_neg(x, "taylor_exp absolute value")?
+    } else {
+        x
+    };
     if abs > Decimal::from(30u32) {
         return Err(CurveError::InvalidConfiguration {
             reason: format!("exponential argument must satisfy |x| <= 30: {x}"),
@@ -267,7 +332,7 @@ pub(crate) fn taylor_exp(x: Decimal) -> Result<Decimal, CurveError> {
         scale: 0,
         value: format!("taylor_exp int part: {}", int_part),
     })?;
-    let frac = abs - int_part;
+    let frac = checked_sub(abs, int_part, "taylor_exp fractional part")?;
 
     // e^int_k via repeated multiplication.
     let base = if x.is_sign_negative() { one_over_e } else { e };
@@ -287,15 +352,19 @@ pub(crate) fn taylor_exp(x: Decimal) -> Result<Decimal, CurveError> {
     let mut frac_pow = Decimal::ONE; // 1
     let mut term = Decimal::ONE; // r^0 / 0!
     for n in 1..=20u32 {
-        term = term * frac / Decimal::from(n);
-        frac_pow += term;
+        term = checked_div(
+            checked_mul(term, frac, "taylor_exp Taylor term")?,
+            Decimal::from(n),
+            "taylor_exp factorial",
+        )?;
+        frac_pow = checked_add(frac_pow, term, "taylor_exp Taylor sum")?;
     }
 
     let frac_pow = if x.is_sign_negative() {
         if frac_pow.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        Decimal::ONE / frac_pow
+        checked_div(Decimal::ONE, frac_pow, "taylor_exp reciprocal")?
     } else {
         frac_pow
     };

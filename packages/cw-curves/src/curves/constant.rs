@@ -1,7 +1,10 @@
 use cosmwasm_std::{Decimal as StdDecimal, Uint128};
 use rust_decimal::Decimal;
 
-use crate::{utils::decimal_to_std, Curve, CurveError, DecimalPlaces};
+use crate::{
+    utils::{checked_div, checked_mul, decimal_to_std},
+    Curve, CurveError, DecimalPlaces,
+};
 
 /// spot price is always a constant value
 pub struct Constant {
@@ -27,7 +30,11 @@ impl Curve for Constant {
     /// Note that both need to be normalized.
     fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
         // f(x) = supply * self.value
-        let reserve = self.normalize.from_supply(supply)? * self.value;
+        let reserve = checked_mul(
+            self.normalize.from_supply(supply)?,
+            self.value,
+            "constant reserve",
+        )?;
         self.normalize.to_reserve(reserve)
     }
 
@@ -36,7 +43,11 @@ impl Curve for Constant {
         if self.value.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        let supply = self.normalize.from_reserve(reserve)? / self.value;
+        let supply = checked_div(
+            self.normalize.from_reserve(reserve)?,
+            self.value,
+            "constant supply",
+        )?;
         self.normalize.to_supply(supply)
     }
 }

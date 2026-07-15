@@ -2,7 +2,7 @@ use cosmwasm_std::{Decimal as StdDecimal, Uint128};
 use rust_decimal::Decimal;
 
 use crate::{
-    utils::{decimal_to_std, square_root},
+    utils::{checked_div, checked_mul, decimal_to_std, square_root},
     Curve, CurveError, DecimalPlaces,
 };
 
@@ -21,7 +21,11 @@ impl Linear {
 impl Curve for Linear {
     fn spot_price(&self, supply: Uint128) -> Result<StdDecimal, CurveError> {
         // f(x) = supply * self.value
-        let out = self.normalize.from_supply(supply)? * self.slope;
+        let out = checked_mul(
+            self.normalize.from_supply(supply)?,
+            self.slope,
+            "linear spot price",
+        )?;
         decimal_to_std(out)
     }
 
@@ -35,7 +39,11 @@ impl Curve for Linear {
                 value: supply.to_string(),
             })?;
         // Note: multiplying by 0.5 is much faster than dividing by 2
-        let reserve = square * self.slope * Decimal::new(5, 1);
+        let reserve = checked_mul(
+            checked_mul(square, self.slope, "linear reserve slope")?,
+            Decimal::new(5, 1),
+            "linear reserve half",
+        )?;
         self.normalize.to_reserve(reserve)
     }
 
@@ -51,7 +59,11 @@ impl Curve for Linear {
                 scale: self.normalize.reserve,
                 value: reserve.to_string(),
             })?;
-        let square = self.normalize.from_reserve(doubled)? / self.slope;
+        let square = checked_div(
+            self.normalize.from_reserve(doubled)?,
+            self.slope,
+            "linear inverse",
+        )?;
         let supply = square_root(square)?;
         self.normalize.to_supply(supply)
     }

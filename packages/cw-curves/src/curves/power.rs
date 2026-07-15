@@ -2,7 +2,7 @@ use cosmwasm_std::{Decimal as StdDecimal, Uint128};
 use rust_decimal::Decimal;
 
 use crate::{
-    utils::{decimal_to_std, pow_rational},
+    utils::{checked_div, checked_mul, decimal_to_std, pow_rational},
     Curve, CurveError, DecimalPlaces,
 };
 
@@ -70,7 +70,7 @@ impl Curve for Power {
         // f(x) = slope * supply^(num/den)
         let s = self.normalize.from_supply(supply)?;
         let powered = pow_rational(s, self.exponent_num, self.exponent_den)?;
-        decimal_to_std(self.slope * powered)
+        decimal_to_std(checked_mul(self.slope, powered, "power spot price")?)
     }
 
     fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
@@ -78,9 +78,17 @@ impl Curve for Power {
         let s = self.normalize.from_supply(supply)?;
         let integral_num = self.integral_num()?;
         let powered = pow_rational(s, integral_num, self.exponent_den)?;
-        let coefficient =
-            self.slope * Decimal::from(self.exponent_den) / Decimal::from(integral_num);
-        self.normalize.to_reserve(coefficient * powered)
+        let coefficient = checked_div(
+            checked_mul(
+                self.slope,
+                Decimal::from(self.exponent_den),
+                "power reserve coefficient numerator",
+            )?,
+            Decimal::from(integral_num),
+            "power reserve coefficient",
+        )?;
+        self.normalize
+            .to_reserve(checked_mul(coefficient, powered, "power reserve result")?)
     }
 
     fn supply(&self, reserve: Uint128) -> Result<Uint128, CurveError> {
@@ -90,12 +98,16 @@ impl Curve for Power {
         }
         let r = self.normalize.from_reserve(reserve)?;
         let integral_num = self.integral_num()?;
-        let numerator = Decimal::from(integral_num) * r;
-        let denominator = self.slope * Decimal::from(self.exponent_den);
+        let numerator = checked_mul(Decimal::from(integral_num), r, "power inverse numerator")?;
+        let denominator = checked_mul(
+            self.slope,
+            Decimal::from(self.exponent_den),
+            "power inverse denominator",
+        )?;
         if denominator.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        let base = numerator / denominator;
+        let base = checked_div(numerator, denominator, "power inverse base")?;
         let supply = pow_rational(base, self.exponent_den, integral_num)?;
         self.normalize.to_supply(supply)
     }
