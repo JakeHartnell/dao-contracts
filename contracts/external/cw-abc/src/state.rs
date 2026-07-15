@@ -170,6 +170,10 @@ impl Default for HatcherState {
 /// Per-hatcher state, keyed by address. See [`HatcherState`].
 pub const HATCHERS: Map<&Addr, HatcherState> = Map::new("hatchers");
 
+/// Gross reserve contributed during Hatch. Maintained on every Hatch buy so
+/// lifecycle transitions remain O(1).
+pub const TOTAL_HATCH_CONTRIBUTIONS: Item<Uint128> = Item::new("total_hatch_contributions");
+
 /// Keep track of the donated amounts per user
 pub static DONATIONS: Map<&Addr, Uint128> = Map::new("donations");
 

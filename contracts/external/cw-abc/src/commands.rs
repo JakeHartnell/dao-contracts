@@ -1,5 +1,5 @@
 use cosmwasm_std::{
-    to_json_binary, Addr, Attribute, BankMsg, Coin, CosmosMsg, DepsMut, Env, MessageInfo, Order,
+    to_json_binary, Addr, Attribute, BankMsg, Coin, CosmosMsg, DepsMut, Env, MessageInfo,
     QuerierWrapper, Response, StdResult, Storage, Timestamp, Uint128, WasmMsg,
 };
 use cw_tokenfactory_issuer::msg::ExecuteMsg as IssuerExecuteMsg;
@@ -7,17 +7,45 @@ use cw_utils::must_pay;
 use std::ops::Deref;
 
 use crate::abc::{CommonsPhase, CurveType, HatchConfig, MinMax};
-use crate::helpers::{calculate_buy_quote, calculate_sell_quote, vested_amount};
+use crate::helpers::{calculate_buy_quote, calculate_sell_quote};
 use crate::msg::{HatcherAllowlistEntryMsg, UpdatePhaseConfigMsg};
 use crate::state::{
     hatcher_allowlist, HatcherAllowlistConfig, HatcherAllowlistConfigType, RefundSnapshot,
     CURVE_STATE, CURVE_TYPE, DONATIONS, FUNDING_POOL_FORWARDING, HATCHERS,
     HATCHER_DAO_PRIORITY_QUEUE, IS_PAUSED, MAX_SUPPLY, PHASE, PHASE_CONFIG, REFUND_SNAPSHOT,
-    SUPPLY_DENOM, TOKEN_ISSUER_CONTRACT,
+    SUPPLY_DENOM, TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::ContractError;
 
-pub fn buy(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, ContractError> {
+fn assert_deadline(env: &Env, deadline: Option<Timestamp>) -> Result<(), ContractError> {
+    if let Some(deadline) = deadline {
+        if env.block.time > deadline {
+            return Err(ContractError::DeadlineExpired {
+                deadline: deadline.seconds(),
+                now: env.block.time.seconds(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn assert_minimum_output(minimum: Option<Uint128>, actual: Uint128) -> Result<(), ContractError> {
+    if let Some(minimum) = minimum {
+        if actual < minimum {
+            return Err(ContractError::SlippageExceeded { minimum, actual });
+        }
+    }
+    Ok(())
+}
+
+pub fn buy(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    min_tokens: Option<Uint128>,
+    deadline: Option<Timestamp>,
+) -> Result<Response, ContractError> {
+    assert_deadline(&env, deadline)?;
     let curve_type = CURVE_TYPE.load(deps.storage)?;
     let mut curve_state = CURVE_STATE.load(deps.storage)?;
 
@@ -26,9 +54,11 @@ pub fn buy(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
     // Load the phase config and phase
     let phase_config = PHASE_CONFIG.load(deps.storage)?;
     let mut phase = PHASE.load(deps.storage)?;
+    let was_hatch = matches!(phase, CommonsPhase::Hatch);
 
     // Calculate the curve state from the buy
     let buy_quote = calculate_buy_quote(payment, &curve_type, &curve_state, &phase, &phase_config)?;
+    assert_minimum_output(min_tokens, buy_quote.amount)?;
 
     // L-2: collect any allowlist-warning attributes for surfacing on the
     // buy response (e.g. `try_dao_query_failed` events when a configured
@@ -47,8 +77,16 @@ pub fn buy(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
             )?;
             allowlist_attrs = attrs;
 
-            // Update hatcher state with the gross contribution and the
-            // freshly-minted tokens.
+            // `initial_raise.max` is a hard reserve cap. Reject an overshoot
+            // rather than silently opening above the configured economics.
+            if buy_quote.new_reserve > hatch_config.initial_raise.max {
+                return Err(ContractError::InitialRaiseCapExceeded {
+                    max: hatch_config.initial_raise.max,
+                    attempted: buy_quote.new_reserve,
+                });
+            }
+
+            // Update hatcher and aggregate state incrementally.
             let updated_state =
                 HATCHERS.update(deps.storage, &info.sender, |maybe| -> StdResult<_> {
                     let mut state = maybe.unwrap_or_default();
@@ -57,7 +95,6 @@ pub fn buy(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
                     Ok(state)
                 })?;
 
-            // Check contribution is within limits (uses gross contribution)
             if updated_state.contributed < hatch_config.contribution_limits.min
                 || updated_state.contributed > hatch_config.contribution_limits.max
             {
@@ -66,22 +103,15 @@ pub fn buy(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
                     max: hatch_config.contribution_limits.max,
                 });
             }
+            TOTAL_HATCH_CONTRIBUTIONS
+                .update(deps.storage, |total| -> Result<_, ContractError> {
+                    Ok(total.checked_add(payment)?)
+                })?;
 
-            // Check if the initial_raise max has been met
-            if buy_quote.new_reserve >= hatch_config.initial_raise.max {
-                // Transition to the Open phase
+            // Exact boundary opens the curve. No hatcher/allowlist scan or
+            // address stamping is needed because unsafe vesting is disabled.
+            if buy_quote.new_reserve == hatch_config.initial_raise.max {
                 phase = CommonsPhase::Open;
-
-                // Stamp every hatcher's vesting_started_at so their tokens
-                // begin unlocking from the transition time. Iteration is
-                // O(N hatchers); N is bounded by initial_raise.max divided
-                // by contribution_limits.min.
-                let now = env.block.time;
-                stamp_hatcher_vesting_clocks(deps.storage, now)?;
-
-                // Allowlist no longer needed
-                hatcher_allowlist().clear(deps.storage);
-
                 PHASE.save(deps.storage, &phase)?;
             }
         }
@@ -114,20 +144,42 @@ pub fn buy(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
         funds: vec![],
     })];
 
-    // Send funding to fee recipient
-    if buy_quote.funded > Uint128::zero() {
-        if let Some(funding_pool_forwarding) = FUNDING_POOL_FORWARDING.may_load(deps.storage)? {
+    // Contribution-derived Hatch fees remain escrowed in this contract until
+    // success, regardless of forwarding configuration. On the successful
+    // transition, release the complete escrow atomically. Open fees retain
+    // the established immediate-forwarding behavior.
+    if was_hatch {
+        if !buy_quote.funded.is_zero() {
+            curve_state.funding = curve_state.funding.checked_add(buy_quote.funded)?;
+        }
+        if matches!(phase, CommonsPhase::Open) {
+            if let Some(recipient) = FUNDING_POOL_FORWARDING.may_load(deps.storage)? {
+                let escrow = curve_state.funding;
+                if !escrow.is_zero() {
+                    msgs.push(CosmosMsg::Bank(BankMsg::Send {
+                        to_address: recipient.to_string(),
+                        amount: vec![Coin {
+                            amount: escrow,
+                            denom: curve_state.reserve_denom.clone(),
+                        }],
+                    }));
+                    curve_state.funding = Uint128::zero();
+                }
+            }
+        }
+    } else if !buy_quote.funded.is_zero() {
+        if let Some(recipient) = FUNDING_POOL_FORWARDING.may_load(deps.storage)? {
             msgs.push(CosmosMsg::Bank(BankMsg::Send {
-                to_address: funding_pool_forwarding.to_string(),
+                to_address: recipient.to_string(),
                 amount: vec![Coin {
                     amount: buy_quote.funded,
                     denom: curve_state.reserve_denom.clone(),
                 }],
-            }))
+            }));
         } else {
-            curve_state.funding += buy_quote.funded;
+            curve_state.funding = curve_state.funding.checked_add(buy_quote.funded)?;
         }
-    };
+    }
 
     // Save the new curve state
     curve_state.supply = buy_quote.new_supply;
@@ -147,28 +199,15 @@ pub fn buy(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
         .add_attributes(allowlist_attrs))
 }
 
-/// Stamp `vesting_started_at` on every existing hatcher entry. Called once
-/// at the Hatch → Open transition. Hatchers added after this point (i.e.
-/// no one — we forbid hatch buys after Open) would not need stamping.
-fn stamp_hatcher_vesting_clocks(
-    storage: &mut dyn Storage,
-    now: Timestamp,
-) -> Result<(), ContractError> {
-    let addrs: Vec<Addr> = HATCHERS
-        .keys(storage, None, None, Order::Ascending)
-        .collect::<StdResult<Vec<_>>>()?;
-    for addr in addrs {
-        HATCHERS.update(storage, &addr, |maybe| -> StdResult<_> {
-            let mut state = maybe.unwrap_or_default();
-            state.vesting_started_at = Some(now);
-            Ok(state)
-        })?;
-    }
-    Ok(())
-}
-
 /// Sell tokens on the bonding curve
-pub fn sell(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, ContractError> {
+pub fn sell(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    min_reserve: Option<Uint128>,
+    deadline: Option<Timestamp>,
+) -> Result<Response, ContractError> {
+    assert_deadline(&env, deadline)?;
     let curve_type = CURVE_TYPE.load(deps.storage)?;
     let supply_denom = SUPPLY_DENOM.load(deps.storage)?;
     let burn_amount = must_pay(&info, &supply_denom)?;
@@ -179,24 +218,6 @@ pub fn sell(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Cont
     let phase_config = PHASE_CONFIG.load(deps.storage)?;
     let phase = PHASE.load(deps.storage)?;
 
-    // H-1: enforce hatcher vesting before letting hatchers exit.
-    // Non-hatchers (no entry in HATCHERS) sell freely. Hatchers' tokens
-    // unlock per `phase_config.vesting`; sells consume from the unlocked
-    // portion via `state.already_burned`.
-    if let Some(state) = HATCHERS.may_load(deps.storage, &info.sender)? {
-        let vested = vested_amount(&state, &phase_config.vesting, env.block.time);
-        let available = vested.saturating_sub(state.already_burned);
-        if burn_amount > available {
-            return Err(ContractError::HatcherTokensNotVested {
-                requested: burn_amount,
-                available,
-            });
-        }
-        let mut updated = state;
-        updated.already_burned = updated.already_burned.checked_add(burn_amount)?;
-        HATCHERS.save(deps.storage, &info.sender, &updated)?;
-    }
-
     // Calculate the sell quote
     let sell_quote = calculate_sell_quote(
         burn_amount,
@@ -205,6 +226,7 @@ pub fn sell(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Cont
         &phase,
         &phase_config,
     )?;
+    assert_minimum_output(min_reserve, sell_quote.amount)?;
 
     let mut send_msgs: Vec<CosmosMsg> = vec![CosmosMsg::Bank(BankMsg::Send {
         to_address: info.sender.to_string(),
@@ -329,12 +351,7 @@ pub fn abort_hatch(deps: DepsMut, env: Env, _info: MessageInfo) -> Result<Respon
 
     // Snapshot the pool and total contributions so claims are deterministic.
     let total_pool = curve_state.reserve.checked_add(curve_state.funding)?;
-    let total_contributed = HATCHERS
-        .range(deps.storage, None, None, Order::Ascending)
-        .try_fold(Uint128::zero(), |acc, item| -> StdResult<_> {
-            let (_addr, state) = item?;
-            Ok(acc + state.contributed)
-        })?;
+    let total_contributed = TOTAL_HATCH_CONTRIBUTIONS.load(deps.storage)?;
 
     REFUND_SNAPSHOT.save(
         deps.storage,
@@ -492,13 +509,13 @@ pub fn withdraw(
     // Validate ownership
     cw_ownable::assert_owner(deps.storage, &info.sender)?;
 
-    // M-5 full: in Refunding the funding pool belongs to hatchers via
-    // pro-rata claims; owner cannot drain it.
+    // Hatch funding includes escrowed contribution fees and is unavailable
+    // until success. Refunding funding belongs to hatchers.
     let phase = PHASE.load(deps.storage)?;
-    if matches!(phase, CommonsPhase::Refunding) {
+    if matches!(phase, CommonsPhase::Hatch | CommonsPhase::Refunding) {
         return Err(ContractError::InvalidPhase {
-            expected: "Hatch | Open | Closed".to_string(),
-            actual: "Refunding".to_string(),
+            expected: "Open | Closed".to_string(),
+            actual: format!("{:?}", phase),
         });
     }
 
@@ -853,8 +870,8 @@ pub fn update_phase_config(
                 phase_config.hatch.hatch_deadline = hatch_deadline;
             }
 
-            // Validate config
-            phase_config.hatch.validate()?;
+            // Validate the complete config, including the vesting safety gate.
+            phase_config.validate()?;
             PHASE_CONFIG.save(deps.storage, &phase_config)?;
 
             Ok(Response::new().add_attribute("action", "update_hatch_phase_config"))
@@ -874,8 +891,8 @@ pub fn update_phase_config(
                 phase_config.open.exit_fee = exit_fee;
             }
 
-            // Validate config
-            phase_config.open.validate()?;
+            // Validate the complete config, including the vesting safety gate.
+            phase_config.validate()?;
             PHASE_CONFIG.save(deps.storage, &phase_config)?;
 
             Ok(Response::new().add_attribute("action", "update_open_phase_config"))
@@ -1067,6 +1084,16 @@ mod tests {
             let curve_state = CURVE_STATE.load(&deps.storage)?;
             assert_that!(curve_state.funding).is_equal_to(Uint128::from(donation_amount));
 
+            // Hatch funding is escrowed and cannot be withdrawn before a
+            // successful transition.
+            let result = withdraw(
+                deps.as_mut(),
+                mock_env(),
+                mock_info(crate::testing::TEST_CREATOR, &[]),
+                None,
+            );
+            assert!(matches!(result, Err(ContractError::InvalidPhase { .. })));
+
             // Check random can't withdraw from the funding pool
             let result = withdraw(deps.as_mut(), mock_env(), mock_info("random", &[]), None);
             assert_that!(result)
@@ -1075,7 +1102,8 @@ mod tests {
                     cw_ownable::OwnershipError::NotOwner,
                 ));
 
-            // Check owner can withdraw
+            // Check owner can withdraw once Hatch has succeeded.
+            PHASE.save(&mut deps.storage, &CommonsPhase::Open)?;
             let result = withdraw(
                 deps.as_mut(),
                 mock_env(),

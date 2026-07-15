@@ -62,10 +62,20 @@ pub enum UpdatePhaseConfigMsg {
 pub enum ExecuteMsg {
     /// Buy will attempt to purchase as many supply tokens as possible.
     /// You must send only reserve tokens.
-    Buy {},
+    Buy {
+        /// Optional minimum supply tokens that must be minted.
+        min_tokens: Option<Uint128>,
+        /// Optional latest accepted block time. Equality is accepted.
+        deadline: Option<cosmwasm_std::Timestamp>,
+    },
     /// Sell burns supply tokens in return for the reserve token.
     /// You must send only supply tokens.
-    Sell {},
+    Sell {
+        /// Optional minimum reserve tokens that must be returned.
+        min_reserve: Option<Uint128>,
+        /// Optional latest accepted block time. Equality is accepted.
+        deadline: Option<cosmwasm_std::Timestamp>,
+    },
     /// Donate will donate tokens to the funding pool.
     /// You must send only reserve tokens.
     Donate {},

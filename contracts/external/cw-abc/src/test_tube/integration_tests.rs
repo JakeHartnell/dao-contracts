@@ -48,8 +48,15 @@ fn test_happy_path() {
     );
 
     // Buy tokens
-    abc.execute(&ExecuteMsg::Buy {}, &coins(1000, RESERVE), &accounts[0])
-        .unwrap();
+    abc.execute(
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
+        &coins(1000, RESERVE),
+        &accounts[0],
+    )
+    .unwrap();
 
     // Query denom
     let denom = tf_issuer
@@ -132,7 +139,10 @@ fn test_happy_path() {
     // Trying to sell is an error
     let err = abc
         .execute(
-            &ExecuteMsg::Sell {},
+            &ExecuteMsg::Sell {
+                min_reserve: None,
+                deadline: None,
+            },
             &coins(1000, denom.clone()),
             &accounts[0],
         )
@@ -140,8 +150,15 @@ fn test_happy_path() {
     assert_eq!(err, abc.execute_error(ContractError::CommonsHatch {}));
 
     // Buy enough tokens to end the hatch phase
-    abc.execute(&ExecuteMsg::Buy {}, &coins(999999, RESERVE), &accounts[1])
-        .unwrap();
+    abc.execute(
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
+        &coins(999999, RESERVE),
+        &accounts[1],
+    )
+    .unwrap();
 
     // Contract is now in open phase
     let phase: CommonsPhaseConfigResponse = abc.query(&QueryMsg::PhaseConfig {}).unwrap();
@@ -165,7 +182,10 @@ fn test_happy_path() {
 
     // Sell
     abc.execute(
-        &ExecuteMsg::Sell {},
+        &ExecuteMsg::Sell {
+            min_reserve: None,
+            deadline: None,
+        },
         &coins(1000, denom.clone()),
         &accounts[0],
     )
@@ -231,7 +251,10 @@ fn test_contribution_limits_enforced() {
     // Buy more tokens then the max contribution limit errors
     let err = abc
         .execute(
-            &ExecuteMsg::Buy {},
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
             &coins(1_000_000_000, RESERVE),
             &accounts[0],
         )
@@ -246,7 +269,14 @@ fn test_contribution_limits_enforced() {
 
     // Buy less tokens then the min contribution limit errors
     let err = abc
-        .execute(&ExecuteMsg::Buy {}, &coins(1, RESERVE), &accounts[0])
+        .execute(
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
+            &coins(1, RESERVE),
+            &accounts[0],
+        )
         .unwrap_err();
 
     assert_eq!(
@@ -271,7 +301,10 @@ fn test_max_supply() {
 
     // Buy enough tokens to end the hatch phase
     abc.execute(
-        &ExecuteMsg::Buy {},
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
         &coins(1_000_000, RESERVE),
         &accounts[0],
     )
@@ -280,7 +313,10 @@ fn test_max_supply() {
     // Buy enough tokens to trigger a max supply error
     let err = abc
         .execute(
-            &ExecuteMsg::Buy {},
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
             &coins(10000000000000, RESERVE),
             &accounts[0],
         )
@@ -317,7 +353,10 @@ fn test_max_supply() {
 
     // Purchase large amount of coins succeeds
     abc.execute(
-        &ExecuteMsg::Buy {},
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
         &coins(10000000000000, RESERVE),
         &accounts[0],
     )
@@ -441,7 +480,14 @@ fn test_allowlist() {
 
     // Account not on the hatch allowlist can't purchase
     let err = abc
-        .execute(&ExecuteMsg::Buy {}, &coins(1000, RESERVE), &accounts[3])
+        .execute(
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
+            &coins(1000, RESERVE),
+            &accounts[3],
+        )
         .unwrap_err();
     assert_eq!(
         err,
@@ -451,8 +497,15 @@ fn test_allowlist() {
     );
 
     // Account on allowlist can purchase
-    abc.execute(&ExecuteMsg::Buy {}, &coins(1000, RESERVE), &accounts[1])
-        .unwrap();
+    abc.execute(
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
+        &coins(1000, RESERVE),
+        &accounts[1],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -474,8 +527,15 @@ fn test_close_curve() {
         .denom;
 
     // Buy enough tokens to end the hatch phase
-    abc.execute(&ExecuteMsg::Buy {}, &coins(1000000, RESERVE), &accounts[0])
-        .unwrap();
+    abc.execute(
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
+        &coins(1000000, RESERVE),
+        &accounts[0],
+    )
+    .unwrap();
 
     // Only owner can close the curve
     let err = abc
@@ -494,13 +554,27 @@ fn test_close_curve() {
 
     // Can no longer buy
     let err = abc
-        .execute(&ExecuteMsg::Buy {}, &coins(1000, RESERVE), &accounts[0])
+        .execute(
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
+            &coins(1000, RESERVE),
+            &accounts[0],
+        )
         .unwrap_err();
     assert_eq!(err, abc.execute_error(ContractError::CommonsClosed {}));
 
     // Can sell
-    abc.execute(&ExecuteMsg::Sell {}, &coins(100, denom), &accounts[0])
-        .unwrap();
+    abc.execute(
+        &ExecuteMsg::Sell {
+            min_reserve: None,
+            deadline: None,
+        },
+        &coins(100, denom),
+        &accounts[0],
+    )
+    .unwrap();
 }
 
 // TODO maybe we don't allow for updating the curve in the MVP as it could lead
@@ -525,7 +599,10 @@ fn test_update_curve() {
 
     // Buy enough tokens to end the hatch phase
     abc.execute(
-        &ExecuteMsg::Buy {},
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
         &coins(1_000_000, RESERVE),
         &accounts[0],
     )
@@ -581,7 +658,10 @@ fn test_update_curve() {
     );
 
     abc.execute(
-        &ExecuteMsg::Sell {},
+        &ExecuteMsg::Sell {
+            min_reserve: None,
+            deadline: None,
+        },
         &coins(9000000, denom.clone()),
         &accounts[0],
     )
@@ -695,7 +775,14 @@ fn test_dao_hatcher() {
 
     // Check contribution limit at this point
     let err = abc
-        .execute(&ExecuteMsg::Buy {}, &coins(1000, RESERVE), &accounts[0])
+        .execute(
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
+            &coins(1000, RESERVE),
+            &accounts[0],
+        )
         .unwrap_err();
     assert_eq!(
         err,
@@ -718,7 +805,14 @@ fn test_dao_hatcher() {
 
     // The error should say 1k is the max contribution now
     let err = abc
-        .execute(&ExecuteMsg::Buy {}, &coins(2000, RESERVE), &accounts[0])
+        .execute(
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
+            &coins(2000, RESERVE),
+            &accounts[0],
+        )
         .unwrap_err();
     assert_eq!(
         err,
@@ -729,12 +823,22 @@ fn test_dao_hatcher() {
     );
 
     // Adhering to the limit makes this ok now
-    let result = abc.execute(&ExecuteMsg::Buy {}, &coins(40, RESERVE), &accounts[0]);
+    let result = abc.execute(
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
+        &coins(40, RESERVE),
+        &accounts[0],
+    );
     assert!(result.is_ok());
 
     // Check not allowlisted
     let result = abc.execute(
-        &ExecuteMsg::Buy {},
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
         &coins(1000, RESERVE),
         &accounts[accounts.len() - 1],
     );
@@ -767,7 +871,14 @@ fn test_dao_hatcher() {
 
     // The user has already funded 40, so providing their limit should error
     let err = abc
-        .execute(&ExecuteMsg::Buy {}, &coins(2000, RESERVE), &accounts[0])
+        .execute(
+            &ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
+            &coins(2000, RESERVE),
+            &accounts[0],
+        )
         .unwrap_err();
     assert_eq!(
         err,
@@ -778,6 +889,13 @@ fn test_dao_hatcher() {
     );
 
     // Funding the remainder is ok
-    let result = abc.execute(&ExecuteMsg::Buy {}, &coins(1960, RESERVE), &accounts[0]);
+    let result = abc.execute(
+        &ExecuteMsg::Buy {
+            min_tokens: None,
+            deadline: None,
+        },
+        &coins(1960, RESERVE),
+        &accounts[0],
+    );
     assert!(result.is_ok());
 }

@@ -81,7 +81,10 @@ fn test_stake_unstake_new_denom() {
     // Buy tokens off of bonding curve
     cw_abc
         .execute(
-            &cw_abc::msg::ExecuteMsg::Buy {},
+            &cw_abc::msg::ExecuteMsg::Buy {
+                min_tokens: None,
+                deadline: None,
+            },
             &coins(100000, RESERVE),
             &accounts[0],
         )

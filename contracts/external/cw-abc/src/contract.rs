@@ -16,7 +16,7 @@ use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 use crate::state::{
     CurveState, CURVE_STATE, CURVE_TYPE, FUNDING_POOL_FORWARDING, IS_PAUSED, MAX_SUPPLY, PHASE,
-    PHASE_CONFIG, SUPPLY_DENOM, TEMP_SUPPLY, TOKEN_ISSUER_CONTRACT,
+    PHASE_CONFIG, SUPPLY_DENOM, TEMP_SUPPLY, TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::{commands, queries};
 
@@ -122,6 +122,7 @@ pub fn instantiate(
 
     // Save the curve state
     CURVE_STATE.save(deps.storage, &curve_state)?;
+    TOTAL_HATCH_CONTRIBUTIONS.save(deps.storage, &Uint128::zero())?;
 
     // Set the paused state
     IS_PAUSED.save(deps.storage, &false)?;
@@ -151,8 +152,14 @@ pub fn execute(
     }
 
     match msg {
-        ExecuteMsg::Buy {} => commands::buy(deps, env, info),
-        ExecuteMsg::Sell {} => commands::sell(deps, env, info),
+        ExecuteMsg::Buy {
+            min_tokens,
+            deadline,
+        } => commands::buy(deps, env, info, min_tokens, deadline),
+        ExecuteMsg::Sell {
+            min_reserve,
+            deadline,
+        } => commands::sell(deps, env, info, min_reserve, deadline),
         ExecuteMsg::Close {} => commands::close(deps, info),
         ExecuteMsg::Donate {} => commands::donate(deps, env, info),
         ExecuteMsg::Withdraw { amount } => commands::withdraw(deps, env, info, amount),

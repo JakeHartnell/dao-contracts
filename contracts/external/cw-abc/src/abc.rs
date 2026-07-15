@@ -225,6 +225,12 @@ impl CommonsPhase {
 impl CommonsPhaseConfig {
     /// Validate that the commons configuration is valid
     pub fn validate(&self) -> Result<(), ContractError> {
+        // Address-based accounting cannot secure a transferable native token:
+        // a hatcher can transfer to a fresh address and bypass it.
+        ensure!(
+            matches!(self.vesting, VestingSchedule::None),
+            ContractError::UnsafeVestingConfiguration {}
+        );
         self.hatch.validate()?;
         self.open.validate()?;
         self.closed.validate()?;

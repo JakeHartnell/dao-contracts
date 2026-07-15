@@ -2,8 +2,8 @@
 //! Medium finding, asserting the defended-against behavior is now rejected.
 //!
 //! Tests use `mock_dependencies` directly. Cw-multi-test integration tests
-//! that exercise the issuer round-trip (mint/burn) for the H-1 vesting
-//! matrix, C-2 factory auth, and full M-5 ClaimRefund flow are tracked as
+//! that exercise the issuer round-trip (mint/burn), C-2 factory auth, and
+//! full M-5 ClaimRefund flow are tracked as
 //! a separate follow-on; the precondition checks below cover the auth /
 //! validation surface.
 
@@ -21,7 +21,7 @@ use crate::msg::{InstantiateMsg, UpdatePhaseConfigMsg};
 use crate::state::{
     HatcherAllowlistConfig, HatcherAllowlistConfigType, HatcherAllowlistEntry, HatcherState,
     RefundSnapshot, CURVE_STATE, HATCHERS, PHASE, REFUND_SNAPSHOT, SUPPLY_DENOM,
-    TOKEN_ISSUER_CONTRACT,
+    TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::testing::{default_instantiate_msg, mock_init, TEST_CREATOR, TEST_RESERVE_DENOM};
 use crate::ContractError;
@@ -427,6 +427,8 @@ fn m5_buy_rejected_in_refunding() {
         deps.as_mut(),
         mock_env(),
         mock_info("buyer", &[coin(100, TEST_RESERVE_DENOM)]),
+        None,
+        None,
     );
     assert!(matches!(res, Err(ContractError::CommonsClosed {})));
 }
@@ -551,88 +553,224 @@ fn l3_update_hatch_allowlist_rejects_non_owner() {
     assert!(matches!(res, Err(ContractError::Ownership(_))));
 }
 
-// ============================================================
-// H-1: vested_amount math (covers the scheduler in isolation)
-// ============================================================
+fn prepare_buys(storage: &mut dyn cosmwasm_std::Storage) {
+    TOKEN_ISSUER_CONTRACT
+        .save(storage, &Addr::unchecked("issuer"))
+        .unwrap();
+}
 
 #[test]
-fn h1_vested_amount_none_returns_minted() {
-    use crate::helpers::vested_amount;
-    let mut state = HatcherState::new();
-    state.minted = Uint128::new(1000);
-    state.vesting_started_at = Some(Timestamp::from_seconds(100));
-    let now = Timestamp::from_seconds(150);
+fn insecure_address_vesting_cannot_be_configured() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.phase_config.vesting = VestingSchedule::Linear {
+        duration_seconds: 86_400,
+    };
+    assert!(matches!(
+        mock_init(deps.as_mut(), msg),
+        Err(ContractError::UnsafeVestingConfiguration {})
+    ));
+}
+
+#[test]
+fn hatch_aggregate_makes_abort_independent_of_hatcher_count() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.phase_config.hatch.hatch_deadline = Some(Timestamp::from_seconds(1));
+    msg.phase_config.hatch.initial_raise.min = Uint128::new(500);
+    mock_init(deps.as_mut(), msg).unwrap();
+    for i in 0..1_000u32 {
+        let mut state = HatcherState::new();
+        state.contributed = Uint128::one();
+        HATCHERS
+            .save(&mut deps.storage, &Addr::unchecked(format!("h{i}")), &state)
+            .unwrap();
+    }
+    // Deliberately differs from the per-address sum: AbortHatch must read
+    // this O(1) invariant rather than scanning HATCHERS.
+    TOTAL_HATCH_CONTRIBUTIONS
+        .save(&mut deps.storage, &Uint128::new(77))
+        .unwrap();
+    let mut env = mock_env();
+    env.block.time = Timestamp::from_seconds(2);
+    commands::abort_hatch(deps.as_mut(), env, mock_info("anyone", &[])).unwrap();
     assert_eq!(
-        vested_amount(&state, &VestingSchedule::None, now),
-        Uint128::new(1000)
+        REFUND_SNAPSHOT
+            .load(&deps.storage)
+            .unwrap()
+            .total_contributed,
+        Uint128::new(77)
     );
 }
 
 #[test]
-fn h1_vested_amount_cliff_pre_returns_zero() {
-    use crate::helpers::vested_amount;
-    let mut state = HatcherState::new();
-    state.minted = Uint128::new(1000);
-    state.vesting_started_at = Some(Timestamp::from_seconds(100));
-    let schedule = VestingSchedule::Cliff {
-        duration_seconds: 100,
+fn hatch_fees_are_escrowed_and_cap_is_hard() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.funding_pool_forwarding = Some("fee-recipient".to_string());
+    msg.curve_type = CurveType::Constant {
+        value: Uint128::one(),
+        scale: 0,
     };
-    let now = Timestamp::from_seconds(150);
-    assert_eq!(vested_amount(&state, &schedule, now), Uint128::zero());
-}
+    msg.phase_config.hatch.initial_raise.max = Uint128::new(100);
+    mock_init(deps.as_mut(), msg).unwrap();
+    prepare_buys(&mut deps.storage);
 
-#[test]
-fn h1_vested_amount_cliff_post_returns_minted() {
-    use crate::helpers::vested_amount;
-    let mut state = HatcherState::new();
-    state.minted = Uint128::new(1000);
-    state.vesting_started_at = Some(Timestamp::from_seconds(100));
-    let schedule = VestingSchedule::Cliff {
-        duration_seconds: 100,
-    };
-    let now = Timestamp::from_seconds(250);
-    assert_eq!(vested_amount(&state, &schedule, now), Uint128::new(1000));
-}
-
-#[test]
-fn h1_vested_amount_linear_partial() {
-    use crate::helpers::vested_amount;
-    let mut state = HatcherState::new();
-    state.minted = Uint128::new(1000);
-    state.vesting_started_at = Some(Timestamp::from_seconds(100));
-    let schedule = VestingSchedule::Linear {
-        duration_seconds: 1000,
-    };
-    let now = Timestamp::from_seconds(600); // 500/1000 = 50%
-    assert_eq!(vested_amount(&state, &schedule, now), Uint128::new(500));
-}
-
-#[test]
-fn h1_vested_amount_linear_full() {
-    use crate::helpers::vested_amount;
-    let mut state = HatcherState::new();
-    state.minted = Uint128::new(1000);
-    state.vesting_started_at = Some(Timestamp::from_seconds(100));
-    let schedule = VestingSchedule::Linear {
-        duration_seconds: 1000,
-    };
-    let now = Timestamp::from_seconds(2000); // past full duration
-    assert_eq!(vested_amount(&state, &schedule, now), Uint128::new(1000));
-}
-
-#[test]
-fn h1_vested_amount_no_clock_returns_minted() {
-    // Defensive: if vesting_started_at is None (caller skipped phase
-    // transition), treat as fully vested so math is well-defined.
-    use crate::helpers::vested_amount;
-    let mut state = HatcherState::new();
-    state.minted = Uint128::new(1000);
-    state.vesting_started_at = None;
-    let schedule = VestingSchedule::Linear {
-        duration_seconds: 1000,
-    };
+    let first = commands::buy(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("one", &[coin(50, TEST_RESERVE_DENOM)]),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(first.messages.len(), 1, "hatch only emits mint");
     assert_eq!(
-        vested_amount(&state, &schedule, Timestamp::from_seconds(0)),
-        Uint128::new(1000)
+        CURVE_STATE.load(&deps.storage).unwrap().funding,
+        Uint128::new(5)
+    );
+    assert!(matches!(
+        commands::withdraw(deps.as_mut(), mock_env(), mock_info(TEST_CREATOR, &[]), None),
+        Err(ContractError::InvalidPhase { actual, .. }) if actual == "Hatch"
+    ));
+
+    // 61 -> 55 reserve + 6 fee. This reaches 100 reserve exactly and
+    // releases all 11 escrowed fee units only after transition to Open.
+    let second = commands::buy(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("two", &[coin(61, TEST_RESERVE_DENOM)]),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(second.messages.len(), 2, "mint plus escrow release");
+    assert_eq!(
+        CURVE_STATE.load(&deps.storage).unwrap().funding,
+        Uint128::zero()
+    );
+    assert_eq!(PHASE.load(&deps.storage).unwrap(), CommonsPhase::Open);
+
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.curve_type = CurveType::Constant {
+        value: Uint128::one(),
+        scale: 0,
+    };
+    msg.phase_config.hatch.initial_raise.max = Uint128::new(100);
+    mock_init(deps.as_mut(), msg).unwrap();
+    prepare_buys(&mut deps.storage);
+    assert!(matches!(
+        commands::buy(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("over", &[coin(112, TEST_RESERVE_DENOM)]),
+            None,
+            None
+        ),
+        Err(ContractError::InitialRaiseCapExceeded { .. })
+    ));
+}
+
+#[test]
+fn abort_snapshots_full_retained_hatch_pool() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.funding_pool_forwarding = Some("fee-recipient".to_string());
+    msg.phase_config.hatch.hatch_deadline = Some(Timestamp::from_seconds(1));
+    msg.phase_config.hatch.initial_raise.min = Uint128::new(100);
+    mock_init(deps.as_mut(), msg).unwrap();
+    prepare_buys(&mut deps.storage);
+    commands::buy(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("one", &[coin(50, TEST_RESERVE_DENOM)]),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut env = mock_env();
+    env.block.time = Timestamp::from_seconds(2);
+    commands::abort_hatch(deps.as_mut(), env, mock_info("anyone", &[])).unwrap();
+    assert_eq!(
+        REFUND_SNAPSHOT.load(&deps.storage).unwrap().total_pool,
+        Uint128::new(50)
+    );
+}
+
+#[test]
+fn buy_rejects_expired_and_degraded_quotes() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    prepare_buys(&mut deps.storage);
+    let env = mock_env();
+    assert!(matches!(
+        commands::buy(
+            deps.as_mut(),
+            env.clone(),
+            mock_info("one", &[coin(10, TEST_RESERVE_DENOM)]),
+            None,
+            Some(env.block.time.minus_seconds(1))
+        ),
+        Err(ContractError::DeadlineExpired { .. })
+    ));
+    assert!(matches!(
+        commands::buy(
+            deps.as_mut(),
+            env,
+            mock_info("one", &[coin(10, TEST_RESERVE_DENOM)]),
+            Some(Uint128::MAX),
+            None
+        ),
+        Err(ContractError::SlippageExceeded { .. })
+    ));
+}
+
+#[test]
+fn sell_rejects_expired_and_degraded_quotes() {
+    let mut deps = mock_dependencies();
+    let msg = default_instantiate_msg(
+        0,
+        0,
+        CurveType::Constant {
+            value: Uint128::one(),
+            scale: 0,
+        },
+    );
+    mock_init(deps.as_mut(), msg).unwrap();
+    PHASE.save(&mut deps.storage, &CommonsPhase::Open).unwrap();
+    SUPPLY_DENOM
+        .save(&mut deps.storage, &"supply".to_string())
+        .unwrap();
+    CURVE_STATE
+        .update(&mut deps.storage, |mut state| -> Result<_, ContractError> {
+            state.supply = Uint128::new(100);
+            state.reserve = Uint128::new(100);
+            Ok(state)
+        })
+        .unwrap();
+
+    let env = mock_env();
+    assert!(matches!(
+        commands::sell(
+            deps.as_mut(),
+            env.clone(),
+            mock_info("seller", &[coin(10, "supply")]),
+            None,
+            Some(env.block.time.minus_seconds(1))
+        ),
+        Err(ContractError::DeadlineExpired { .. })
+    ));
+    let err = commands::sell(
+        deps.as_mut(),
+        env,
+        mock_info("seller", &[coin(10, "supply")]),
+        Some(Uint128::MAX),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ContractError::SlippageExceeded { .. }),
+        "unexpected error: {err:?}"
     );
 }

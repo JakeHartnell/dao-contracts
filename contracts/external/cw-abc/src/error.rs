@@ -31,6 +31,20 @@ pub enum ContractError {
     #[error("Cannot mint more tokens than the maximum supply of {max}")]
     CannotExceedMaxSupply { max: Uint128 },
 
+    #[error("Hatch raise cap exceeded: maximum {max}, attempted reserve {attempted}")]
+    InitialRaiseCapExceeded { max: Uint128, attempted: Uint128 },
+
+    #[error("Execution deadline {deadline} has expired at {now}")]
+    DeadlineExpired { deadline: u64, now: u64 },
+
+    #[error("Slippage protection failed: minimum {minimum}, actual {actual}")]
+    SlippageExceeded { minimum: Uint128, actual: Uint128 },
+
+    #[error(
+        "Hatcher vesting is disabled until transferable tokens can be escrowed at asset level"
+    )]
+    UnsafeVestingConfiguration {},
+
     #[error(
         "New curve would imply reserve {new_reserve_at_current_supply} at current supply, \
          but recorded reserve is {current_reserve} (drift exceeds tolerance {tolerance})"
