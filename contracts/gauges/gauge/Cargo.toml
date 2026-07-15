@@ -1,0 +1,48 @@
+[package]
+name = "gauge-orchestrator"
+description = "Stake-weighted multi-gauge orchestrator for DAO DAO"
+version = { workspace = true }
+authors = ["Cosmorama <cosmorama@proton.me>"]
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+backtraces = ["cosmwasm-std/backtraces"]
+library = []
+
+[dependencies]
+cosmwasm-schema = { workspace = true }
+cosmwasm-std = { workspace = true }
+dao-interface = { workspace = true }
+cw-hooks = { workspace = true }
+cw-storage-plus = { workspace = true }
+cw-utils = { workspace = true }
+cw2 = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+semver = { workspace = true }
+thiserror = { workspace = true }
+cw4 = { workspace = true }
+dao-hooks = { workspace = true }
+gauge-interface = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+dao-dao-core = { workspace = true }
+cw-multi-test = { workspace = true }
+dao-proposal-single = { workspace = true }
+cw4-group = { workspace = true }
+cw20 = { workspace = true }
+cw20-base = { workspace = true, features = ["library"] }
+cw20-stake = { workspace = true, features = ["library"] }
+cw721-base = { workspace = true, features = ["library"] }
+dao-voting-cw4 = { workspace = true }
+dao-voting-cw20-staked = { workspace = true, features = ["library"] }
+dao-voting-cw721-staked = { workspace = true, features = ["library"] }
+dao-voting-token-staked = { workspace = true, features = ["library"] }
+dao-voting = { workspace = true }
+proptest = { workspace = true }
