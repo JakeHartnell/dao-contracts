@@ -291,19 +291,15 @@ pub fn sell(
         .add_attribute("funded", sell_quote.funded))
 }
 
-/// Transitions the bonding curve to a closed phase where only sells are allowed
+/// Transitions an open bonding curve to a closed phase where only sells are allowed.
 pub fn close(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
     cw_ownable::assert_owner(deps.storage, &info.sender)?;
 
-    // M-5 full: Refunding is terminal (driven by AbortHatch); cannot be
-    // overridden by Close.
+    // Hatch funds are escrowed until the raise succeeds. Requiring Open also
+    // keeps Refunding terminal and prevents Close followed by Withdraw from
+    // bypassing either lifecycle guard.
     let phase = PHASE.load(deps.storage)?;
-    if matches!(phase, CommonsPhase::Refunding) {
-        return Err(ContractError::InvalidPhase {
-            expected: "Hatch | Open".to_string(),
-            actual: "Refunding".to_string(),
-        });
-    }
+    phase.expect_open()?;
 
     // I-2: zero out the open-phase exit fee so the stored config matches
     // runtime behavior (calculate_sell_quote returns Decimal::zero() for
@@ -879,6 +875,17 @@ pub fn update_phase_config(
 
             // Validate the complete config, including the vesting safety gate.
             phase_config.validate()?;
+
+            // A hatch only transitions on an exact buy to initial_raise.max.
+            // Moving the cap to or behind the current reserve would make that
+            // success transition unreachable and strand escrow indefinitely.
+            let curve_state = CURVE_STATE.load(deps.storage)?;
+            if phase_config.hatch.initial_raise.max <= curve_state.reserve {
+                return Err(ContractError::HatchPhaseConfigError(format!(
+                    "initial_raise.max ({}) must be greater than current reserve ({})",
+                    phase_config.hatch.initial_raise.max, curve_state.reserve
+                )));
+            }
             PHASE_CONFIG.save(deps.storage, &phase_config)?;
 
             Ok(Response::new().add_attribute("action", "update_hatch_phase_config"))

@@ -344,6 +344,81 @@ fn h3_h4_update_phase_config_rejects_100_percent() {
     assert!(matches!(err, ContractError::InvalidExitFee {}));
 }
 
+#[test]
+fn close_then_withdraw_cannot_drain_hatch_escrow() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    CURVE_STATE
+        .update(&mut deps.storage, |mut state| -> Result<_, ContractError> {
+            state.reserve = Uint128::new(80);
+            state.funding = Uint128::new(20);
+            Ok(state)
+        })
+        .unwrap();
+
+    let close_err = commands::close(deps.as_mut(), mock_info(TEST_CREATOR, &[])).unwrap_err();
+    assert!(matches!(
+        close_err,
+        ContractError::InvalidPhase { actual, .. } if actual == "Hatch"
+    ));
+
+    let withdraw_err = commands::withdraw(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(TEST_CREATOR, &[]),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        withdraw_err,
+        ContractError::InvalidPhase { actual, .. } if actual == "Hatch"
+    ));
+    assert_eq!(PHASE.load(&deps.storage).unwrap(), CommonsPhase::Hatch);
+    assert_eq!(
+        CURVE_STATE.load(&deps.storage).unwrap().funding,
+        Uint128::new(20)
+    );
+}
+
+fn update_hatch_raise_max_at_reserve(max: u128) -> ContractError {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    CURVE_STATE
+        .update(&mut deps.storage, |mut state| -> Result<_, ContractError> {
+            state.reserve = Uint128::new(100);
+            Ok(state)
+        })
+        .unwrap();
+
+    commands::update_phase_config(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(TEST_CREATOR, &[]),
+        UpdatePhaseConfigMsg::Hatch {
+            initial_raise: Some(MinMax {
+                min: Uint128::new(10),
+                max: Uint128::new(max),
+            }),
+            entry_fee: None,
+            contribution_limits: None,
+            hatch_deadline: None,
+        },
+    )
+    .unwrap_err()
+}
+
+#[test]
+fn update_hatch_config_rejects_raise_max_equal_to_current_reserve() {
+    let err = update_hatch_raise_max_at_reserve(100);
+    assert!(matches!(err, ContractError::HatchPhaseConfigError(_)));
+}
+
+#[test]
+fn update_hatch_config_rejects_raise_max_below_current_reserve() {
+    let err = update_hatch_raise_max_at_reserve(99);
+    assert!(matches!(err, ContractError::HatchPhaseConfigError(_)));
+}
+
 // ============================================================
 // H-5: decimals < 38 enforced
 // ============================================================

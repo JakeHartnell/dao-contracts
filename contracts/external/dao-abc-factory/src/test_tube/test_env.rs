@@ -3,11 +3,11 @@
 #![allow(dead_code)]
 
 use crate::{
-    msg::{ExecuteMsg, InstantiateMsg, QueryMsg},
+    msg::{ApprovedCode, ExecuteMsg, InstantiateMsg, QueryMsg},
     ContractError,
 };
 
-use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128, WasmMsg};
+use cosmwasm_std::{to_json_binary, Addr, Binary, Coin, Decimal, Uint128, WasmMsg};
 use cw_abc::abc::{
     ClosedConfig, CommonsPhaseConfig, CurveType, HatchConfig, MinMax, OpenConfig, ReserveToken,
     SupplyToken,
@@ -30,9 +30,9 @@ use dao_voting::threshold::ActiveThreshold;
 use osmosis_test_tube::{
     osmosis_std::types::{
         cosmos::bank::v1beta1::QueryAllBalancesRequest,
-        cosmwasm::wasm::v1::MsgExecuteContractResponse,
+        cosmwasm::wasm::v1::{MsgExecuteContractResponse, QueryCodeRequest, QueryCodeResponse},
     },
-    Account, Bank, Module, OsmosisTestApp, RunnerError, RunnerExecuteResult, RunnerResult,
+    Account, Bank, Module, OsmosisTestApp, Runner, RunnerError, RunnerExecuteResult, RunnerResult,
     SigningAccount, Wasm,
 };
 use serde::de::DeserializeOwned;
@@ -43,6 +43,32 @@ pub const JUNO: &str = "ujuno";
 
 // Needs to match what's configured for test-tube
 pub const RESERVE: &str = "uosmo";
+
+fn code_checksum(app: &OsmosisTestApp, code_id: u64) -> Binary {
+    let checksum = app
+        .query::<QueryCodeRequest, QueryCodeResponse>(
+            "/cosmwasm.wasm.v1.Query/Code",
+            &QueryCodeRequest { code_id },
+        )
+        .unwrap()
+        .code_info
+        .expect("uploaded code must have code info")
+        .data_hash;
+    Binary::from(checksum)
+}
+
+fn factory_instantiate_msg(app: &OsmosisTestApp, abc_id: u64, issuer_id: u64) -> InstantiateMsg {
+    InstantiateMsg {
+        approved_abc: vec![ApprovedCode {
+            code_id: abc_id,
+            checksum: code_checksum(app, abc_id),
+        }],
+        approved_token_issuers: vec![ApprovedCode {
+            code_id: issuer_id,
+            checksum: code_checksum(app, issuer_id),
+        }],
+    }
+}
 
 pub struct TestEnv<'a> {
     pub app: &'a OsmosisTestApp,
@@ -123,9 +149,13 @@ impl TestEnvBuilder {
         let issuer_id = TokenfactoryIssuer::upload(app, &accounts[0]).unwrap();
         let abc_id = CwAbc::upload(app, &accounts[0]).unwrap();
 
-        // Upload and instantiate abc factory
-        let dao_abc_factory =
-            AbcFactoryContract::new(app, &InstantiateMsg {}, &accounts[0]).unwrap();
+        // Upload and instantiate abc factory with the live uploaded checksums.
+        let dao_abc_factory = AbcFactoryContract::new(
+            app,
+            &factory_instantiate_msg(app, abc_id, issuer_id),
+            &accounts[0],
+        )
+        .unwrap();
 
         let vp_contract = TokenVotingContract::new(
             app,
@@ -228,9 +258,13 @@ impl TestEnvBuilder {
         let proposal_single_id = DaoProposalSingle::upload(app, &accounts[0]).unwrap();
         let abc_id = CwAbc::upload(app, &accounts[0]).unwrap();
 
-        // Upload and instantiate abc factory
-        let dao_abc_factory =
-            AbcFactoryContract::new(app, &InstantiateMsg {}, &accounts[0]).unwrap();
+        // Upload and instantiate abc factory with the live uploaded checksums.
+        let dao_abc_factory = AbcFactoryContract::new(
+            app,
+            &factory_instantiate_msg(app, abc_id, issuer_id),
+            &accounts[0],
+        )
+        .unwrap();
 
         let msg = dao_interface::msg::InstantiateMsg {
             dao_uri: None,
