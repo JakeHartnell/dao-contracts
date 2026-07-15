@@ -1,119 +1,409 @@
-# Production readiness goal: Augmented Bonding Curves
+# Production-ready DAO DAO gauges
 
-## Objective
+## Goal
 
-Ship a production release of `cw-abc`, `cw-curves`, and `dao-abc-factory` that is safe to deploy through DAO DAO on explicitly supported CosmWasm chains.
+Ship the `gauge-orchestrator`, marketing `gauge-adapter`, and
+`gauge-budget-allocator` as production CosmWasm contracts whose accounting is
+correct under adversarial inputs, whose hooks cannot silently drift or block
+staking, whose migrations and operational controls are safe, and whose release
+artifacts have been independently reviewed and exercised on a representative
+chain.
 
-Production-ready means the economic and state-machine invariants are defined and tested, all work is bounded by chain gas limits, privileged and dependency trust is explicit, artifacts are reproducible, and an independent auditor has approved the exact release commit and Wasm checksums.
+This plan is based on the code in
+[PR #928](https://github.com/DA0-DA0/dao-contracts/pull/928) at `d2da47e60` and
+an engineering review performed on 2026-07-13. It is a readiness plan, not a
+completed security audit. Every finding below must be confirmed with a failing
+regression test before or alongside its fix.
 
-This plan covers PR [#926](https://github.com/DA0-DA0/dao-contracts/pull/926) at `32a0f26ea`. The checked-in May 9 internal review is useful input, but is not production sign-off: material vesting, refund, Power, and Sigmoid code landed after its review scope, and it excluded important issuer and integration surfaces.
+Production means all P0 and P1 work and every release gate in this document are
+complete. P2 items may be deferred only by an explicit, documented maintainer
+decision that names the owner, residual risk, and follow-up milestone.
 
-## Release gates
+## Current baseline
 
-No mainnet deployment until every P0 item is complete. P1 items are required before a general production launch. P2 items may run in parallel, but documentation and economic sign-off must be complete before a public launch.
+The PR already provides three contracts, checked-in JSON schemas, extensive
+`cw-multi-test` coverage, READMEs, formatting/clippy cleanup, and reported
+release Wasm builds. The public PR report currently shows high patch coverage,
+but also reports uncovered changed lines and a project coverage decrease.
 
-### P0 — Correctness and security blockers
+The test suite could not be independently rerun in the live review workspace
+because an incomplete, ignored `contracts/voting/dao-voting-juno-staked`
+directory is matched by the workspace glob, causing Cargo resolution to fail
+before compilation. This appears to be local environmental residue rather than
+a tracked PR defect. Reproduction from a clean clone and required green CI are
+therefore explicit gates below.
 
-- [ ] **Redesign vesting so transfers cannot bypass it.** The current check is attached to `HATCHERS[info.sender]`, while the tokenfactory supply token is transferable. A hatcher can transfer locked tokens to a fresh address and sell them; conversely, later Open-phase tokens held by a hatcher can be incorrectly constrained.
-  - Choose and document an asset-level design: vesting escrow/claim token, transfer-restricted hatch receipt converted on vesting, issuer send hook, or transfer-aware locked-lot accounting.
-  - Prove with multi-test and chain-level tests that direct, partial, multi-hop, split, merge, and mixed vested/unvested transfers cannot make locked value sellable.
-  - Prove that legitimately unlocked and Open-purchased tokens remain sellable.
-  - Add randomized transfer/buy/sell sequence invariants.
+## P0 — correctness and security blockers
 
-- [ ] **Make every lifecycle transition bounded and practically O(1).** Hatch-to-Open currently rewrites every hatcher, and `AbortHatch` folds every hatcher. `contribution_limits.min` can be zero or dust, so either transition can exceed block gas and become permanently unreachable.
-  - Store a single Open/vesting start timestamp instead of stamping each account.
-  - Maintain total contributed incrementally instead of scanning the map on abort.
-  - Cap all remaining vectors and per-call DAO queries using measured chain gas limits.
-  - Demonstrate transition gas is independent of population with at least 10,000 simulated hatchers and remains below each supported chain's budget with a documented safety margin.
+No public testnet program or production deployment should proceed until every
+item in this section is resolved.
 
-- [ ] **Validate all curve configurations before storage and eliminate contract-reachable traps.** Add a fallible `CurveType::validate` used by instantiate, update, and queries/calculations as appropriate.
-  - Bound decimals, scale, slopes, coefficients, exponent numerator/denominator, `num + den`, midpoint, steepness, amplitude, and supported supply/reserve domains.
-  - Replace assertions, unchecked arithmetic, and silent non-convergence with typed errors.
-  - Fuzz every numeric boundary, including zero, one, maxima, decimal extremes, and near-`Uint128`/`u32` limits; no valid execute or query may panic or trap.
+### P0.1 Preserve tally invariants for every vote input
 
-- [ ] **Remove Sigmoid from the production API or complete a dedicated quantitative review and audit.** Its numerical reserve and inverse use different integration precision, documented error is large enough to be economically relevant, and non-convergence currently returns an estimate.
-  - If retained, establish justified full-domain error bounds, monotonicity, deterministic native/Wasm parity, bounded gas, and no profitable fee-free round trip or transaction-splitting strategy beyond an explicit rounding budget.
-  - Non-convergence must return an error.
-  - Apply the same domain/error analysis to Power; feature-gate any curve not approved for production.
+`PlaceVotes` sums the original vector but collapses it through a `HashMap` while
+computing the diff. Duplicate options can therefore be accounted once in the
+immediate update but stored multiple times and applied multiple times by later
+power-change hooks. Zero-weight and unbounded vote entries also create ambiguous
+state and gas risk.
 
-- [ ] **Pin trusted implementations.** Caller authentication does not make caller-supplied `cw-abc` and issuer code IDs trustworthy.
-  - Configure the production factory with governance-approved code IDs and checksums for both ABC and token issuer implementations.
-  - Reject unapproved implementations and test with interface-compatible malicious contracts.
-  - Expose and emit the selected versions, code IDs, and checksums in factory records/events.
+- [ ] Reject duplicate option names, zero weights, empty option strings, and
+  vote vectors above a documented maximum before reading or mutating tallies.
+- [ ] Decide whether weights must sum to exactly `1.0` or may sum to less; make
+  the API documentation, selection math, and tests agree.
+- [ ] Use checked arithmetic throughout tally updates and return domain-specific
+  errors instead of relying on release-mode overflow/underflow behavior.
+- [ ] Add regression tests for duplicates in the first/middle/last positions,
+  repeated vote replacement, clearing votes, and stake/unstake after each case.
+- [ ] Add property tests that generate vote sequences and power changes and
+  assert after every operation:
+  - `TALLY[(gauge, option)]` equals the sum of live per-voter contributions;
+  - `TOTAL_CAST[gauge]` equals the sum of all option tallies;
+  - every tally has exactly one matching `OPTION_BY_POINTS` entry and no stale
+    index entry exists;
+  - no tally or total can underflow or overflow.
 
-- [ ] **Choose and implement an upgrade strategy.** ABC and issuer instances currently have `admin: None`, making the ABC migrate entrypoint unusable; the factory has no migrate entrypoint.
-  - Record an ADR choosing immutable releases or DAO/timelock-controlled migration.
-  - If immutable, remove misleading migration surfaces and document defect response, user exit, and replacement/fork procedures.
-  - If migratable, use a documented DAO/timelock admin, exact source-version guards, real state transforms, and tests from every supported release.
-  - Rehearse the chosen upgrade or replacement procedure on a representative testnet.
+Relevant code:
+[`contract.rs`](contracts/gauges/gauge/src/contract.rs) (`place_votes`) and
+[`state.rs`](contracts/gauges/gauge/src/state.rs) (`update_tallies`).
 
-- [ ] **Define and prove refund solvency.** Decide whether a failed hatch promises gross-contribution refunds. Today hatch fees may be forwarded or withdrawn before abort, so `reserve + funding` may be less than gross contributions.
-  - If full refunds are promised, escrow all contribution-derived funds until Hatch succeeds and prohibit forwarding/withdrawal beforehand.
-  - Define transferred/lost hatch-token behavior, claim duration, abandonment, finalization, rounding dust, and last-claim policy.
-  - Maintain claimed/refunded aggregates and queries; prove `sum(claims) <= snapshot`, conservation of escrow, and the maximum residual dust.
-  - Test multiple hatchers, donations, forwarding modes, withdrawals, double claims, zero claims, transferred tokens, and abandoned claims.
+### P0.2 Make option removal safe for existing votes
 
-- [ ] **Freeze the final scope and commission an independent external audit.** Scope must include `cw-abc`, every production-enabled `cw-curves` curve, `dao-abc-factory`, `cw-tokenfactory-issuer`, tokenfactory adapters, DAO core/voting callbacks, migrations/admin design, and relevant dependencies.
-  - Include economic invariants, rounding/precision, transfer/vesting bypass, malicious dependency contracts, refund solvency, front-running/slippage, and gas/DoS analysis.
-  - Resolve every Critical and High; document lower-severity dispositions; obtain auditor verification of fixes.
-  - Publish a report tied to the final commit, schemas, optimizer/toolchain, and Wasm checksums.
+`RemoveOption` deletes its tally and sorted index but leaves that option in
+voter records. A later vote replacement or voting-power hook then subtracts the
+old contribution from a missing tally, which can underflow and cause the hook or
+vote transaction to fail. Adapter-side rejection/removal also does not
+automatically invalidate the orchestrator's copy of an option.
 
-### P0 — Required verification infrastructure
+- [ ] Define one removal model: atomically purge/rewrite affected votes in
+  bounded batches, retain a tombstone until all references expire, or make
+  removal part of a resumable state machine.
+- [ ] Block selection and execution of invalidated options as soon as removal
+  starts, without leaving inconsistent totals or indices.
+- [ ] Define and implement synchronization between adapter registry removal and
+  orchestrator option state. Do not allow a rejected marketing submission to
+  remain payable merely because the orchestrator has stale state.
+- [ ] Add tests for removal with zero, one, and many active voters, followed by
+  vote replacement, abstention, cw4 changes, cw20 stake/unstake, cw721
+  stake/unstake, reset, and epoch execution.
+- [ ] Prove the removal path makes bounded progress and publish a keeper/recovery
+  procedure for interrupted batches.
 
-- [ ] **Add state-machine property and fuzz testing.** Generate sequences across instantiate, buy, sell, transfer, pause, phase changes, abort/refund, close, curve/config updates, ownership, and unauthorized calls.
-  - Assert reserve/supply/bank-balance conservation, monotonicity, quote/execute agreement, fee/funding accounting, max-supply bounds, legal transitions, no unauthorized mutation, and no profitable rounding loop beyond a documented bound.
-  - Cover all production curves, fee/limit boundaries, decimal extremes, maximum values, and fixed plus scheduled multi-seed runs.
-  - Persist minimized failures as regressions and maintain a bounded nightly fuzz corpus/job.
+Relevant code: `remove_option` in
+[`contract.rs`](contracts/gauges/gauge/src/contract.rs) and `remove_tally` in
+[`state.rs`](contracts/gauges/gauge/src/state.rs).
 
-- [ ] **Add normal-PR `cw-multi-test` security flows.** Exercise actual issuer messages, replies, and balances rather than directly seeding storage.
-  - Cover vesting and transfer bypasses, factory reverse handshake and malicious implementations, abort/refund/claim, rounding/dust, forwarding modes, DAO-priority allowlists, deadline boundaries, pause behavior, and ownership handoff failures.
+### P0.3 Process all power changes without silent drift
 
-- [ ] **Test and build the complete feature matrix.** For each supported Osmosis, generic CosmWasm, and Thorchain tokenfactory backend:
-  - Enforce exactly one backend at compile time with a clear error.
-  - Run check, unit/multi-test, optimized Wasm build, schema validation, and backend-appropriate integration tests.
-  - Publish an explicit backend × chain × curve × critical-path support matrix. Mark combinations unsupported until proven.
+Each cw4, fungible-stake, and NFT-stake hook queries at most 100 gauge votes for
+a voter and does not continue pagination. Voting in gauge 101 and beyond causes
+those tallies to retain stale power.
 
-- [ ] **Expand real-chain/test-tube coverage.** Exercise every production-enabled curve and the complete Hatch → Open → buy/sell/close and Hatch → Refunding → claim paths, factory/DAO creation, governance interaction, issuer failure, replies, and any supported migration.
+- [ ] Choose and enforce a safe model:
+  - impose a hard, checked maximum number of active gauge votes per voter that
+    is within a measured hook gas budget; or
+  - redesign hook work as a complete, resumable/paginated process without
+    exposing staking operations to partial accounting.
+- [ ] Never silently truncate state-changing iteration. Return an explicit
+  error before an unsupported state can be created.
+- [ ] Apply the same semantics to cw4, cw20/native/token-factory, and cw721
+  power changes.
+- [ ] Test the boundary immediately below, at, and above the chosen limit for
+  every hook type, including stopped and resetting gauges.
+- [ ] Measure worst-case hook gas on the target chain/VM and keep a documented
+  safety margin below transaction gas limits.
 
-### P1 — Protocol and API hardening
+Relevant code: hook handlers in
+[`contract.rs`](contracts/gauges/gauge/src/contract.rs) and
+`query_votes_by_voter` in
+[`state.rs`](contracts/gauges/gauge/src/state.rs).
 
-- [ ] Commit a lifecycle/state-action matrix for `Hatch`, `Open`, `Closed`, `Refunding`, and `Paused`, and mirror it with table-driven tests. Define whether pause freezes everyone or allows only a narrow emergency action set; owners should not implicitly retain arbitrary buy/sell/withdraw access during an emergency pause.
-- [ ] Decide whether `initial_raise.max` is a cap or only a transition trigger. If a cap, reject or partially fill overshoots and prove `reserve <= max` at fee-rounding boundaries.
-- [ ] Bound DAO allowlist entries and smart queries per transaction, or replace sequential DAO queries with proof-based membership. Benchmark worst-case failing queries.
-- [ ] Decide which economic terms become immutable after the first contribution. Publish a privilege matrix for pause, withdraw, forwarding, fees, phase config, curve, max supply, allowlist, close, and ownership. Production ownership must be DAO/timelock controlled and deployment verification must enforce it.
-- [ ] Make factory deployment records authoritative: DAO, voting module, ABC, issuer, denom, backend, code IDs/checksums, version, height, and creation transaction. Define whether a DAO may create multiple curves and expose stable pagination.
-- [ ] Stabilize schemas and events. Emit old/new phase on transitions and old/new values for privileged changes; provide a consolidated status/config query; add schema and event snapshots; define semantic-versioning rules.
+### P0.4 Make reset a correct, resumable state machine
 
-### P1 — CI, artifacts, gas, and operations
+The current reset accepts `batch_size = 0`, which can put a gauge into resetting
+state without advancing it. More generally, reset rewrites processed sorted
+keys to zero and starts each later batch from the beginning; when the number of
+options is at least the batch size, a later call can repeatedly select the same
+zeroed keys instead of reaching the remaining options.
 
-- [ ] Make unit, multi-test, feature-matrix, real-chain integration, schema, optimized artifact, audit, and coverage jobs required PR checks with timeouts and concurrency cancellation.
-- [ ] Add coverage floor and changed-lines coverage for the three new crates and issuer integration. Pin CI actions and installed tools by immutable version/SHA.
-- [ ] Establish per-chain gas baselines for instantiate, quote, buy, sell, every phase transition, abort/claim, allowlist worst case, privileged updates, factory creation, and each curve at small and maximum supported inputs. Upload PR reports and fail absolute or regression thresholds.
-- [ ] Produce backend-qualified, reproducible optimized Wasm artifacts. Rebuild twice, compare checksums (or document unavoidable nondeterminism), run `cosmwasm-check`, enforce size ceilings, and publish schemas, hashes, toolchain/optimizer details, SBOM, licenses, and a source/build manifest.
-- [ ] Create deployment and incident runbooks covering supported chains, checksum/code-ID verification, ownership/admin validation, smoke buys/sells, pause, stalled/failed hatch, reserve/bank divergence, issuer or DAO-query failure, governance compromise, tokenfactory/chain upgrades, and upgrade/replacement procedures.
-- [ ] Add monitoring for phase/pause/admin/config changes, withdrawals/forwarding, refund activation and claims, DAO query failures, stalled hatch, and internal reserve versus actual bank balance.
-- [ ] Complete a testnet launch rehearsal and incident drill; retain deployment manifests, transaction evidence, gas reports, and remediation notes.
+- [ ] Reject zero and cap the maximum batch size.
+- [ ] Persist a stable cursor/phase so every non-empty call either processes new
+  work or completes the reset.
+- [ ] Validate `reset_epoch` and all timestamp arithmetic, including zero,
+  overflow, long downtime, and repeated keeper calls.
+- [ ] Make reset completion idempotent and define whether late schedules catch
+  up from the previous deadline or restart from the current block time.
+- [ ] Test option counts `0`, `1`, `batch-1`, `batch`, `batch+1`, and multiple
+  batches with equal and changing tally values.
+- [ ] Assert after completion that totals and indices are consistent, old votes
+  are expired as intended, voting/execution resume, and a second caller cannot
+  corrupt progress.
 
-### P2 — Economic review and user-facing readiness
+Relevant code: `reset_gauge` in
+[`contract.rs`](contracts/gauges/gauge/src/contract.rs) and `Gauge::is_resetting`
+in [`state.rs`](contracts/gauges/gauge/src/state.rs).
 
-- [ ] Obtain independent token-engineering sign-off on curve parameters, fees, raise bounds, vesting, max supply, refund/shutdown behavior, liquidity/run scenarios, whale/Sybil participation, front-running/slippage, reserve shocks, rounding extraction, and governance changes.
-- [ ] Check the approved launch configuration into a reviewed, immutable deployment manifest.
-- [ ] Replace experimental/stale documentation with schema-valid examples and durable descriptions of every enabled curve, units/decimals, rounding/error bounds, fees, phases, abort/refund, vesting/transfer rules, privileges, supported backends/chains, and safe parameter ranges.
-- [ ] Ensure frontends display phase, fees, price impact/slippage protection, vesting/transfer restrictions, refund terms, owner powers, code version, and checksum before users transact.
+### P0.5 Replace index-based vote-hook failure handling
 
-## Definition of done
+Vote-hook reply IDs are mutable vector indices. If multiple hooks fail during a
+single vote, removing the first shifts later indices; subsequent replies can
+remove a healthy hook or fail out of bounds and revert the vote, contradicting
+the documented non-fatal behavior.
 
-The release is complete only when:
+- [ ] Use stable hook identifiers/addresses, or collect failures and remove them
+  without observing a mutating index space.
+- [ ] Namespace reply IDs so future reply-using features cannot collide.
+- [ ] Bound the number of subscribers and measure worst-case vote gas.
+- [ ] Test two or more simultaneous failures at the first, middle, and last
+  positions and mixed success/failure patterns.
+- [ ] Prove the vote always commits, successful subscribers remain registered,
+  and only failing subscribers are removed.
 
-1. All P0 and P1 checkboxes above are complete with linked tests, ADRs, reports, and runbooks.
-2. CI is green for every advertised backend and chain path, with no stale schemas or unqualified artifacts.
-3. The independent audit is closed against the frozen release commit and exact artifact checksums.
-4. A non-alpha release manifest maps source commit → schemas → Wasm checksums → deployed chain code IDs.
-5. A testnet rehearsal demonstrates creation through DAO DAO, hatch success and failure paths, governance controls, monitoring, and the selected incident/upgrade strategy.
-6. The maintainers record an explicit go/no-go approval for each initial mainnet deployment configuration.
+Relevant code:
+[`hooks.rs`](contracts/gauges/gauge/src/hooks.rs) and the `reply` entry point in
+[`contract.rs`](contracts/gauges/gauge/src/contract.rs).
 
-## Current evidence
+### P0.6 Implement explicit marketing-bond accounting
 
-- `cargo +nightly-2024-01-08 test -p cw-curves --locked`: **33 passed** on 2026-07-14.
-- Existing strengths include seeded differential curve tests, 30 audit-regression unit tests, generated schemas, and Osmosis test-tube flows.
-- These do not close the blockers above: the current vesting bypass, unbounded transitions, unvalidated curve domain, incomplete backend/on-chain matrix, and unaudited post-review code remain production blockers.
+The marketing adapter infers one liability per registry row rather than storing
+bond state. A same-sender overwrite can collect a second bond for one row;
+`ReturnDeposits` includes the synthetic default submission, does not mark debts
+paid or remove them, and can be called again; a later `Reject` can attempt
+another payout. This can strand user deposits or pay liabilities repeatedly
+from unrelated funds of the same denomination.
+
+- [ ] Store the actual bond asset, amount, depositor, and lifecycle state for
+  each bonded submission; synthetic/default entries must have no liability.
+- [ ] Make metadata updates deposit-free or atomically refund/replace the old
+  bond with an explicitly tested policy.
+- [ ] Make refund, soft rejection, hard rejection, and bulk wind-down mutually
+  exclusive, one-time state transitions with state updated before messages are
+  dispatched.
+- [ ] Maintain and query aggregate liabilities; assert contract escrow covers
+  liabilities before and after every transition.
+- [ ] Replace unbounded bulk refund with a cursor-based, idempotent batch flow
+  that reports progress and can safely resume after interruption.
+- [ ] Add native and cw20 tests for overwrite, repeated refund, refund then
+  reject, reject then refund, default entry, partial batches, unexpected token
+  transfers, insufficient escrow, and ownership changes mid-wind-down.
+
+Relevant code: submission, rejection, and refund handlers in
+[`contract.rs`](contracts/gauges/gauge-adapter/src/contract.rs).
+
+### P0.7 Resolve allocation semantics and zero-denominator execution
+
+`max_available_percentage` clamps selected powers, after which the orchestrator
+renormalizes the selected set to 100%. That can redistribute the supposed
+excess and allows a sole capped winner to receive 100%, contrary to the README's
+claim that excess goes to no one. Very small caps can also round every selected
+power to zero, leaving execution to construct ratios with a zero denominator.
+
+- [ ] Specify, with worked examples, whether caps burn/unallocate excess,
+  redistribute it, or cap only selection power.
+- [ ] Make orchestrator and adapter APIs carry the information needed to enforce
+  the chosen semantics; do not hide the denominator through accidental
+  renormalization.
+- [ ] Define behavior for no votes, no qualifying options, all capped values
+  rounding to zero, and adapter returning no messages.
+- [ ] Use checked ratio construction and return a domain error or documented
+  no-op for a zero denominator.
+- [ ] Add table-driven tests for one/many winners, partial turnout, caps above
+  and below actual shares, minimum thresholds, integer dust, and tiny voting
+  power/budgets.
+
+Relevant code: `selected_set` and epoch `execute` in
+[`contract.rs`](contracts/gauges/gauge/src/contract.rs).
+
+## P1 — required hardening and release engineering
+
+### P1.1 Bound every externally influenced loop and payload
+
+- [ ] Set documented limits for gauges per orchestrator, options per gauge,
+  votes per voter/gauge, hook subscribers, adapter messages per execution,
+  option/title/name/URL byte lengths, and initial options.
+- [ ] Paginate `AllOptions`, `AllSubmissions`, and `SubmissionsBySender`; add a
+  sender index rather than scanning all submissions.
+- [ ] Make gauge attachment/import resumable or enforce a proven-safe maximum;
+  do not synchronously import an unbounded adapter response.
+- [ ] Validate budget-allocator destinations as chain addresses at instantiate
+  and add time, since they are later used in `BankMsg::Send`.
+- [ ] Apply `nonpayable` checks to every orchestrator/allocator execute and every
+  marketing-adapter endpoint that is not intentionally receiving the configured
+  native bond; reject rather than trap accidental funds.
+- [ ] Add worst-case WasmVM gas/response-size tests for every bound.
+
+### P1.2 Finish migration design for all three contracts
+
+- [ ] Define a supported source-version matrix and state compatibility policy
+  for each contract.
+- [ ] Marketing and budget adapters must use cw2 to verify contract identity and
+  older version and then write the new version, or remove their migrate entry
+  points until a real migration is available. A successful no-op that leaves
+  the old cw2 version is not acceptable.
+- [ ] Add the missing legacy marketing-adapter migration from the former
+  `Config.admin` layout to `cw-ownable`, initializing ownership without losing
+  config, submissions, balances, or bond liabilities.
+- [ ] Test wrong contract name, same/newer version, every supported old version,
+  ownership preservation, populated state, and interrupted resumable state.
+- [ ] Emit `from_version`, `to_version`, and migrated-record counts.
+- [ ] Reconcile package, artifact, and cw2 names (`gauge-orchestrator` vs
+  `crates.io:gauge`; `gauge-adapter` vs
+  `crates.io:marketing-gauge-adapter`) before the first release.
+
+### P1.3 Freeze and verify the public API
+
+- [ ] Extract the adapter protocol messages/responses into a small shared
+  package. The budget allocator should not depend on the marketing contract to
+  obtain a generic protocol, and copied orchestrator/adapter types must not
+  drift.
+- [ ] Decide whether arbitrary `CosmosMsg` output is intentional. Treat every
+  attached adapter as having DAO execution authority; document that trust
+  boundary and audit/allowlist policy. If narrower authority is intended,
+  validate message types, destinations, denominations, and amounts.
+- [ ] Return the documented `CreateGaugeReply` data and a stable `gauge_id`
+  event attribute, or remove the unused reply contract and update clients.
+- [ ] Add a typed config query exposing owner, DAO core, voting-power source,
+  and hook caller so deployments can be verified.
+- [ ] Define stopped-gauge semantics. Enforce them consistently in voting,
+  power hooks, reset, and execution, and add a safe resume/recovery path or a
+  documented migration procedure.
+- [ ] Decide and test minimum-turnout/quorum behavior; document the accepted
+  economic risk if one low-power voter is intentionally allowed to allocate an
+  entire epoch budget.
+- [ ] Version the API and publish a compatibility matrix for contracts, schemas,
+  DAO core, voting modules, and supported chains.
+
+### P1.4 Correct schemas and documentation
+
+- [ ] Generate schema for every external entry point, including the marketing
+  adapter's real `ExecuteMsg` (not `Empty`) and all `MigrateMsg` types.
+- [ ] Add schema smoke tests that deserialize representative instantiate,
+  execute, query, response, reply, and migrate payloads.
+- [ ] Make docs match code for epoch comparison, stopping, resets, cap behavior,
+  owner/DAO roles, adapter trust, deposits, and `CreateGauge` response data.
+- [ ] Add architecture/threat-model documentation covering accounting
+  invariants, hook failure behavior, malicious adapters/options, keeper
+  liveness, gas exhaustion, escrow, and chain-specific address/denom behavior.
+- [ ] Restore or add the correct Apache-2.0 attribution/NOTICE material for the
+  WyndDAO-derived code. The current README claims gauge-local LICENSE/NOTICE
+  files exist, but they are absent from this branch; complete a provenance and
+  license review before distribution.
+
+### P1.5 Raise the verification bar
+
+- [ ] Reproduce from a clean clone with the pinned toolchain and `--locked`:
+  formatting, clippy with warnings denied, all unit/multitests, all workspace
+  tests, schema regeneration/diff, and release Wasm builds.
+- [ ] Add the invariant/property tests described in P0 and mutation-test the
+  critical accounting, authorization, reset, refund, and reply paths.
+- [ ] Add actual end-to-end suites for cw4, cw20-staked, cw721-staked, and
+  native/token-factory-staked voting modules. Exercise real hook registration
+  and staking contracts rather than only direct synthetic hook messages.
+- [ ] Cover all currently missed changed lines that encode state transitions or
+  error handling. Coverage percentage alone is not the acceptance criterion.
+- [ ] Run dependency/license policy checks in required CI. Modernize/pin CI
+  actions and make audit failures visible and blocking for releases.
+- [ ] Run `cosmwasm-check` (or the project-standard equivalent) on optimized
+  artifacts and verify allowed exports, capabilities, size limits, and no debug
+  entry points.
+- [ ] Commission an independent CosmWasm security audit after fixes stabilize;
+  resolve every critical/high finding and document accepted lower-severity
+  risks.
+- [ ] Run a final adversarial review focused on economic manipulation,
+  permission boundaries, hook liveness, storage growth, and migrations.
+
+## P2 — deployment, observability, and operations
+
+### P2.1 Stable events and monitoring
+
+- [ ] Define stable event attributes for every mutation. Include relevant gauge
+  ID, actor, option, old/new configuration, epoch/next epoch, selected count,
+  message count, bond asset/amount/state, and batch progress.
+- [ ] Add indexer tests for gauge creation, vote, power update, reset, execution,
+  hook removal, submission, rejection, refund, ownership, stop, and resume.
+- [ ] Alert on missed epochs, failed executions, underfunded DAO budgets, hook
+  unregistration/wiring drift, resets without progress, escrow shortfall, and
+  migration/version mismatch.
+- [ ] Provide queries that let operators reconcile on-chain tallies, indices,
+  active votes, liabilities, and batch progress.
+
+### P2.2 Chain-level validation
+
+- [ ] Deploy optimized artifacts to a representative local chain and public
+  testnet with actual DAO core and supported voting/hook contracts.
+- [ ] Exercise cw4, cw20-staked, native/token-factory-staked, and cw721-staked
+  flows: create, vote, change power, remove/invalidate option, execute epoch,
+  fail adapter, reset in batches, stop/resume, transfer ownership, and migrate.
+- [ ] Record transaction gas, Wasm sizes, response sizes, code IDs, addresses,
+  checksums, chain/VM versions, and pass/fail evidence in a checked-in test
+  report.
+- [ ] Soak-test multiple epochs and concurrent keepers with conservative but
+  realistic maximum state.
+
+### P2.3 Reproducible release and controlled rollout
+
+- [ ] Produce deterministic optimized Wasm and independently reproduce every
+  checksum from the tagged source commit.
+- [ ] Publish an artifact manifest mapping filename, package, cw2 identity,
+  semantic version, source commit, optimizer image digest, checksum, schema,
+  and audit report. Decide whether the three crates are published to crates.io.
+- [ ] If crates are published, add them to the publish workflow in dependency
+  order, complete missing package metadata, and verify `cargo package --locked`
+  plus a build/test from each packaged tarball.
+- [ ] Prepare instantiate/migrate proposal payloads, verified hook-registration
+  steps, ownership model, DAO balance preflight, keeper configuration,
+  monitoring dashboard, and rollback/incident proposals before deployment.
+- [ ] Canary with one low-value gauge and conservative limits. Observe at least
+  two complete epochs including a power change and reset before expanding
+  scope.
+- [ ] Use staged treasury limits and require an explicit governance decision to
+  increase them after canary evidence is reviewed.
+
+### P2.4 Runbooks
+
+- [ ] Deployment and configuration verification.
+- [ ] Epoch keeper behavior, retries, duplicate callers, and underfunding.
+- [ ] Reset/removal/refund batch continuation and stuck-state recovery.
+- [ ] Voting hook failure and safe re-registration.
+- [ ] Pause/stop, resume, ownership recovery, emergency migration, and rollback.
+- [ ] Escrow reconciliation and user support for submission bonds.
+- [ ] Security disclosure, incident severity, communication, and postmortem.
+
+## Required release gates
+
+All boxes below are mandatory for the first production deployment.
+
+- [ ] Every P0 item has a regression test that fails on the reviewed commit and
+  passes with the fix.
+- [ ] Every accounting, index, and escrow invariant passes property tests and a
+  populated-state migration test.
+- [ ] Worst-case measured gas for vote, every power hook, selection/execution,
+  reset/removal, attachment, and refund stays within the documented target-chain
+  budget with an agreed safety margin.
+- [ ] Required clean-clone CI is green: locked tests, fmt, clippy, schema diff,
+  optimized Wasm, artifact validation, dependency/security, and license checks.
+- [ ] Checked-in schemas match every deployed binary's API.
+- [ ] Independent audit is complete; no unresolved critical/high issues remain.
+- [ ] Testnet report, artifact manifest/checksums, deployment payloads,
+  dashboards/alerts, and incident runbooks have maintainer sign-off.
+- [ ] Canary exit criteria are met for at least two epochs and governance has
+  explicitly approved production limits and residual risks.
+
+## Suggested delivery order
+
+1. Freeze new features and write failing regressions for P0.1–P0.7.
+2. Fix vote/tally/removal/reset accounting and establish property invariants.
+3. Fix bond escrow/refunds and hook processing/replies.
+4. Bound state and gas, then freeze the shared adapter API and migration model.
+5. Correct schemas/docs/events and complete clean-clone CI plus artifact checks.
+6. Perform chain-level tests and gas measurements.
+7. Obtain independent audit, remediate findings, and rerun the full suite.
+8. Produce release artifacts/runbooks, canary, observe, and only then expand.
+
+## Explicit non-goals for the first release
+
+- Vote-weight decay remains a separate feature unless governance adds it to the
+  threat model and repeats the relevant audit/test gates.
+- New adapter types are deferred until the shared adapter protocol and trust
+  policy are frozen.
+- Performance optimizations that change accounting semantics are deferred until
+  the reference invariant suite exists.

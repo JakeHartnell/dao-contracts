@@ -1,0 +1,242 @@
+name: Gauges
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/gauges.yml"
+      - ".github/workflows/gauge-release-candidate.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "deny.toml"
+      - "contracts/gauges/**"
+      - "packages/gauge-interface/**"
+      - "scripts/schema.sh"
+      - "scripts/build-gauge-release.sh"
+      - "scripts/gauge-release-manifest.sh"
+      - "scripts/validate-gauge-release-evidence.sh"
+      - "scripts/test-gauge-release-evidence.sh"
+      - "scripts/validate-gauge-production-approval.sh"
+      - "scripts/test-gauge-production-approval.sh"
+      - "scripts/test-gauge-packages.sh"
+      - "scripts/validate-gauge-wasm.sh"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/gauges.yml"
+      - ".github/workflows/gauge-release-candidate.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "deny.toml"
+      - "contracts/gauges/**"
+      - "packages/gauge-interface/**"
+      - "scripts/schema.sh"
+      - "scripts/build-gauge-release.sh"
+      - "scripts/gauge-release-manifest.sh"
+      - "scripts/validate-gauge-release-evidence.sh"
+      - "scripts/test-gauge-release-evidence.sh"
+      - "scripts/validate-gauge-production-approval.sh"
+      - "scripts/test-gauge-production-approval.sh"
+      - "scripts/test-gauge-packages.sh"
+      - "scripts/validate-gauge-wasm.sh"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  dependency-policy:
+    name: Security, licenses, and sources
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Enforce production dependency policy
+        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18
+        with:
+          rust-version: "1.81.0"
+          arguments: ""
+          command: check advisories licenses sources
+          command-arguments: --exclude-dev --hide-inclusion-graph
+
+  verify:
+    name: Tests, clippy, and schemas
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@86b6a489cb6118ffdbe1fc3d68f3a1fe98e5b017 # 1.81.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Validate gauge release scripts
+        run: >-
+          bash -n
+          scripts/build-gauge-release.sh
+          scripts/gauge-release-manifest.sh
+          scripts/validate-gauge-release-evidence.sh
+          scripts/test-gauge-release-evidence.sh
+          scripts/validate-gauge-production-approval.sh
+          scripts/test-gauge-production-approval.sh
+          scripts/test-gauge-packages.sh
+          scripts/validate-gauge-wasm.sh
+
+      - name: Test gauge release evidence validation
+        run: |
+          scripts/test-gauge-release-evidence.sh
+          scripts/test-gauge-production-approval.sh
+
+      - name: Run locked workspace tests
+        # osmosis-test-tube uses bindgen and therefore requires libclang even
+        # though the gauge contracts themselves do not.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libclang-dev
+          cargo test --workspace --locked
+
+      - name: Run clippy with warnings denied
+        run: >-
+          cargo clippy --locked --all-targets
+          -p gauge-interface
+          -p gauge-orchestrator
+          -p gauge-adapter
+          -p gauge-budget-allocator
+          -- -D warnings
+
+      - name: Regenerate gauge schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd contracts/gauges/gauge
+            cargo run --locked --example gauge-orchestrator-schema
+            rm -rf schema/raw
+          )
+          (
+            cd contracts/gauges/gauge-adapter
+            cargo run --locked --example gauge-adapter-schema
+            rm -rf schema/raw
+          )
+          (
+            cd contracts/gauges/budget-allocator
+            cargo run --locked --example gauge-budget-allocator-schema
+            rm -rf schema/raw
+          )
+
+      - name: Require checked-in schemas to match
+        run: >-
+          git diff --exit-code --
+          contracts/gauges/gauge/schema/gauge-orchestrator.json
+          contracts/gauges/gauge-adapter/schema/gauge-adapter.json
+          contracts/gauges/budget-allocator/schema/gauge-budget-allocator.json
+
+      - name: Check package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in \
+            gauge-interface \
+            gauge-orchestrator \
+            gauge-adapter \
+            gauge-budget-allocator
+          do
+            cargo package --locked --allow-dirty --no-verify \
+              -p "${package}" --list > "${package}.package-files"
+          done
+          grep -qx LICENSE gauge-interface.package-files
+          grep -qx NOTICE gauge-interface.package-files
+          grep -qx LICENSE gauge-orchestrator.package-files
+          grep -qx NOTICE gauge-orchestrator.package-files
+          grep -qx LICENSE gauge-adapter.package-files
+          grep -qx NOTICE gauge-adapter.package-files
+          grep -qx LICENSE gauge-budget-allocator.package-files
+
+      - name: Build and test packaged gauge tarballs
+        run: scripts/test-gauge-packages.sh
+
+  wasm:
+    name: Wasm build and validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@86b6a489cb6118ffdbe1fc3d68f3a1fe98e5b017 # 1.81.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Build locked release Wasm
+        env:
+          # Rust 1.81 is the last release before reference types became a
+          # default Wasm target feature, matching optimizer 0.17.0.
+          RUSTFLAGS: "-C link-arg=--allow-undefined"
+        run: >-
+          cargo build --locked --release --lib
+          --target wasm32-unknown-unknown
+          -p gauge-orchestrator
+          -p gauge-adapter
+          -p gauge-budget-allocator
+
+      - name: Install CosmWasm validator
+        run: cargo install cosmwasm-check --version 1.5.11 --locked
+
+      - name: Validate Wasm capabilities and exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in \
+            gauge_orchestrator.wasm \
+            gauge_adapter.wasm \
+            gauge_budget_allocator.wasm
+          do
+            cosmwasm-check \
+              "target/wasm32-unknown-unknown/release/${artifact}"
+          done
+          scripts/validate-gauge-wasm.sh \
+            target/wasm32-unknown-unknown/release
+
+      - name: Record checksums and sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/wasm32-unknown-unknown/release
+          sha256sum \
+            gauge_orchestrator.wasm \
+            gauge_adapter.wasm \
+            gauge_budget_allocator.wasm > gauge-checksums.txt
+          wc -c \
+            gauge_orchestrator.wasm \
+            gauge_adapter.wasm \
+            gauge_budget_allocator.wasm > gauge-sizes.txt
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gauge-wasm-unoptimized
+          if-no-files-found: error
+          path: |
+            target/wasm32-unknown-unknown/release/gauge_orchestrator.wasm
+            target/wasm32-unknown-unknown/release/gauge_adapter.wasm
+            target/wasm32-unknown-unknown/release/gauge_budget_allocator.wasm
+            target/wasm32-unknown-unknown/release/gauge-checksums.txt
+            target/wasm32-unknown-unknown/release/gauge-sizes.txt
