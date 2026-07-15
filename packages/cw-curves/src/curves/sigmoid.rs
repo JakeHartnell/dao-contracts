@@ -89,44 +89,31 @@ impl Sigmoid {
         let three = Decimal::from(3u32);
         Ok((h / three) * (f0 + four * odd_sum + two * even_sum + fn_end))
     }
-}
 
-impl Curve for Sigmoid {
-    fn spot_price(&self, supply: Uint128) -> Result<StdDecimal, CurveError> {
-        let s = self.normalize.from_supply(supply);
-        let p = self.price_at(s)?;
-        decimal_to_std(p)
-    }
-
-    fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
-        let s = self.normalize.from_supply(supply);
-        let r = self.integrate(s, 32)?;
-        self.normalize.to_reserve(r)
-    }
-
-    fn supply(&self, reserve: Uint128) -> Result<Uint128, CurveError> {
+    pub(crate) fn supply_with_iterations(
+        &self,
+        reserve: Uint128,
+        max_iterations: u32,
+    ) -> Result<Uint128, CurveError> {
         if self.amplitude.is_zero() || self.steepness.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        let target = self.normalize.from_reserve(reserve);
+        let target = self.normalize.from_reserve(reserve)?;
         if target.is_zero() {
             return Ok(Uint128::zero());
         }
         // Newton-Raphson on g(s) = integrate(s) - target = 0; g'(s) = price_at(s).
-        // Initial guess: midpoint (most curves cross half-amplitude there).
         let mut s = self.midpoint;
         if s <= Decimal::ZERO {
             s = Decimal::ONE;
         }
-        const MAX_ITERS: u32 = 32;
-        for _ in 0..MAX_ITERS {
+        for _ in 0..max_iterations {
             let r = self.integrate(s, 16)?;
             let derivative = self.price_at(s)?;
             if derivative.is_zero() {
                 return Err(CurveError::DivisionByZero);
             }
             let next = s - (r - target) / derivative;
-            // Reject negative iterates (saturation regime); clamp to small positive.
             let next = if next < Decimal::ZERO {
                 s / Decimal::from(2u32)
             } else {
@@ -138,8 +125,27 @@ impl Curve for Sigmoid {
                 return self.normalize.to_supply(s);
             }
         }
-        // Failed to converge in budget. For the common-path consumer this is
-        // a "out of range" signal — return what we have rather than panic.
-        self.normalize.to_supply(s)
+        Err(CurveError::NonConvergence {
+            operation: "sigmoid inverse".into(),
+        })
+    }
+}
+
+impl Curve for Sigmoid {
+    fn spot_price(&self, supply: Uint128) -> Result<StdDecimal, CurveError> {
+        let s = self.normalize.from_supply(supply)?;
+        let p = self.price_at(s)?;
+        decimal_to_std(p)
+    }
+
+    fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
+        let s = self.normalize.from_supply(supply)?;
+        let r = self.integrate(s, 32)?;
+        self.normalize.to_reserve(r)
+    }
+
+    fn supply(&self, reserve: Uint128) -> Result<Uint128, CurveError> {
+        const MAX_ITERS: u32 = 32;
+        self.supply_with_iterations(reserve, MAX_ITERS)
     }
 }

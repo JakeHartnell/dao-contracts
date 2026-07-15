@@ -2,7 +2,7 @@
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
     ensure, to_json_binary, Addr, Binary, CosmosMsg, Deps, DepsMut, Empty, Env, MessageInfo, Order,
-    Reply, Response, StdResult, SubMsg, WasmMsg,
+    Reply, Response, StdResult, SubMsg, WasmMsg, WasmQuery,
 };
 use cw2::set_contract_version;
 use cw_abc::msg::{
@@ -30,15 +30,44 @@ const INSTANTIATE_ABC_REPLY_ID: u64 = 1;
 const DAOS: Map<Addr, Empty> = Map::new("daos");
 const CURRENT_DAO: Item<Addr> = Item::new("current_dao");
 const VOTING_MODULE: Item<Addr> = Item::new("voting_module");
+const APPROVED_ABC: Map<u64, Binary> = Map::new("approved_abc");
+const APPROVED_ISSUERS: Map<u64, Binary> = Map::new("approved_issuers");
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
     deps: DepsMut,
     _env: Env,
     _info: MessageInfo,
-    _msg: InstantiateMsg,
+    msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+
+    ensure!(
+        !msg.approved_abc.is_empty() && !msg.approved_token_issuers.is_empty(),
+        ContractError::Std(cosmwasm_std::StdError::generic_err(
+            "approval lists must not be empty"
+        ))
+    );
+    for approval in msg.approved_abc {
+        ensure!(
+            chain_checksum(deps.as_ref(), approval.code_id)? == approval.checksum,
+            ContractError::ChecksumMismatch {
+                kind: "abc".into(),
+                code_id: approval.code_id
+            }
+        );
+        APPROVED_ABC.save(deps.storage, approval.code_id, &approval.checksum)?;
+    }
+    for approval in msg.approved_token_issuers {
+        ensure!(
+            chain_checksum(deps.as_ref(), approval.code_id)? == approval.checksum,
+            ContractError::ChecksumMismatch {
+                kind: "token issuer".into(),
+                code_id: approval.code_id
+            }
+        );
+        APPROVED_ISSUERS.save(deps.storage, approval.code_id, &approval.checksum)?;
+    }
 
     Ok(Response::new().add_attribute("method", "instantiate"))
 }
@@ -65,6 +94,13 @@ pub fn execute_token_factory_factory(
     code_id: u64,
     msg: AbcInstantiateMsg,
 ) -> Result<Response, ContractError> {
+    require_approved(deps.as_ref(), &APPROVED_ABC, "abc", code_id)?;
+    require_approved(
+        deps.as_ref(),
+        &APPROVED_ISSUERS,
+        "token issuer",
+        msg.token_issuer_code_id,
+    )?;
     // Reverse-handshake authentication: the caller (info.sender) claims to
     // be a DAO's voting module. We accept the claim only if (a) the caller
     // responds to `VotingModuleQueryMsg::Dao` with some DAO address, and
@@ -104,6 +140,37 @@ pub fn execute_token_factory_factory(
     );
 
     Ok(Response::new().add_submessage(msg))
+}
+
+fn chain_checksum(deps: Deps, code_id: u64) -> Result<Binary, ContractError> {
+    let info: cosmwasm_std::CodeInfoResponse =
+        deps.querier
+            .query(&cosmwasm_std::QueryRequest::Wasm(WasmQuery::CodeInfo {
+                code_id,
+            }))?;
+    Ok(Binary::from(info.checksum.to_vec()))
+}
+
+fn require_approved(
+    deps: Deps,
+    map: &Map<u64, Binary>,
+    kind: &str,
+    code_id: u64,
+) -> Result<(), ContractError> {
+    let expected =
+        map.may_load(deps.storage, code_id)?
+            .ok_or_else(|| ContractError::UnapprovedCode {
+                kind: kind.into(),
+                code_id,
+            })?;
+    ensure!(
+        chain_checksum(deps, code_id)? == expected,
+        ContractError::ChecksumMismatch {
+            kind: kind.into(),
+            code_id
+        }
+    );
+    Ok(())
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -200,5 +267,72 @@ pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response, ContractE
                 })?))
         }
         _ => Err(ContractError::UnknownReplyId { id: msg.id }),
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use cosmwasm_std::{
+        testing::mock_dependencies, ContractResult, HexBinary, QuerierResult, SystemResult,
+    };
+
+    fn with_code_checksums(
+        deps: &mut cosmwasm_std::OwnedDeps<
+            cosmwasm_std::MemoryStorage,
+            cosmwasm_std::testing::MockApi,
+            cosmwasm_std::testing::MockQuerier,
+        >,
+    ) {
+        deps.querier.update_wasm(|query| -> QuerierResult {
+            match query {
+                WasmQuery::CodeInfo { code_id } => {
+                    let checksum = HexBinary::from(vec![*code_id as u8; 32]);
+                    SystemResult::Ok(ContractResult::Ok(
+                        to_json_binary(&cosmwasm_std::CodeInfoResponse::new(
+                            *code_id,
+                            "creator".into(),
+                            checksum,
+                        ))
+                        .unwrap(),
+                    ))
+                }
+                _ => panic!("unexpected query"),
+            }
+        });
+    }
+
+    #[test]
+    fn rejects_unapproved_abc_and_issuer_code_ids() {
+        let deps = mock_dependencies();
+        assert!(matches!(
+            require_approved(deps.as_ref(), &APPROVED_ABC, "abc", 7),
+            Err(ContractError::UnapprovedCode { code_id: 7, .. })
+        ));
+        assert!(matches!(
+            require_approved(deps.as_ref(), &APPROVED_ISSUERS, "token issuer", 9),
+            Err(ContractError::UnapprovedCode { code_id: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_mismatched_abc_and_issuer_checksums() {
+        let mut deps = mock_dependencies();
+        with_code_checksums(&mut deps);
+        APPROVED_ABC
+            .save(&mut deps.storage, 7, &Binary::from(vec![0u8; 32]))
+            .unwrap();
+        APPROVED_ISSUERS
+            .save(&mut deps.storage, 9, &Binary::from(vec![0u8; 32]))
+            .unwrap();
+
+        assert!(matches!(
+            require_approved(deps.as_ref(), &APPROVED_ABC, "abc", 7),
+            Err(ContractError::ChecksumMismatch { code_id: 7, .. })
+        ));
+        assert!(matches!(
+            require_approved(deps.as_ref(), &APPROVED_ISSUERS, "token issuer", 9),
+            Err(ContractError::ChecksumMismatch { code_id: 9, .. })
+        ));
     }
 }

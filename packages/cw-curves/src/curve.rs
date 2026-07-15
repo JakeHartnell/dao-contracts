@@ -4,7 +4,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use crate::utils::decimal;
+use crate::utils::try_decimal;
 
 /// Errors that can occur during curve evaluation. L-5: replaces the
 /// previous `unwrap()` panics with typed errors so consumers can choose
@@ -15,6 +15,10 @@ pub enum CurveError {
     Overflow { scale: u32, value: String },
     #[error("curve division by zero")]
     DivisionByZero,
+    #[error("curve did not converge: {operation}")]
+    NonConvergence { operation: String },
+    #[error("invalid curve configuration: {reason}")]
+    InvalidConfiguration { reason: String },
 }
 
 /// This defines the curves we are using.
@@ -63,8 +67,19 @@ impl DecimalPlaces {
     }
 
     pub fn to_reserve(self, reserve: Decimal) -> Result<Uint128, CurveError> {
-        let factor = decimal(10u128.pow(self.reserve), 0);
-        let out = reserve * factor;
+        let raw = 10u128
+            .checked_pow(self.reserve)
+            .ok_or_else(|| CurveError::Overflow {
+                scale: self.reserve,
+                value: "reserve decimal factor".into(),
+            })?;
+        let factor = try_decimal(raw, 0)?;
+        let out = reserve
+            .checked_mul(factor)
+            .ok_or_else(|| CurveError::Overflow {
+                scale: self.reserve,
+                value: reserve.to_string(),
+            })?;
         out.floor()
             .to_u128()
             .map(Uint128::from)
@@ -75,8 +90,19 @@ impl DecimalPlaces {
     }
 
     pub fn to_supply(self, supply: Decimal) -> Result<Uint128, CurveError> {
-        let factor = decimal(10u128.pow(self.supply), 0);
-        let out = supply * factor;
+        let raw = 10u128
+            .checked_pow(self.supply)
+            .ok_or_else(|| CurveError::Overflow {
+                scale: self.supply,
+                value: "supply decimal factor".into(),
+            })?;
+        let factor = try_decimal(raw, 0)?;
+        let out = supply
+            .checked_mul(factor)
+            .ok_or_else(|| CurveError::Overflow {
+                scale: self.supply,
+                value: supply.to_string(),
+            })?;
         out.floor()
             .to_u128()
             .map(Uint128::from)
@@ -86,11 +112,11 @@ impl DecimalPlaces {
             })
     }
 
-    pub fn from_supply(&self, supply: Uint128) -> Decimal {
-        decimal(supply, self.supply)
+    pub fn from_supply(&self, supply: Uint128) -> Result<Decimal, CurveError> {
+        try_decimal(supply, self.supply)
     }
 
-    pub fn from_reserve(&self, reserve: Uint128) -> Decimal {
-        decimal(reserve, self.reserve)
+    pub fn from_reserve(&self, reserve: Uint128) -> Result<Decimal, CurveError> {
+        try_decimal(reserve, self.reserve)
     }
 }

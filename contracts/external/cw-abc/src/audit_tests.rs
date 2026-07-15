@@ -35,6 +35,64 @@ fn linear_msg() -> InstantiateMsg {
     default_instantiate_msg(2, 8, curve_type)
 }
 
+#[test]
+fn curve_validation_rejects_unsupported_decimal_inputs_without_panicking() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.curve_type = CurveType::Constant {
+        value: Uint128::new(1),
+        scale: 29,
+    };
+    assert!(matches!(
+        mock_init(deps.as_mut(), msg),
+        Err(ContractError::InvalidCurve { .. })
+    ));
+
+    let mut msg = linear_msg();
+    msg.curve_type = CurveType::Constant {
+        value: Uint128::new(1u128 << 96),
+        scale: 0,
+    };
+    assert!(matches!(
+        mock_init(deps.as_mut(), msg),
+        Err(ContractError::CurveError(_))
+    ));
+}
+
+#[test]
+fn curve_validation_rejects_huge_power_exponent() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.curve_type = CurveType::Power {
+        slope: Uint128::one(),
+        scale: 0,
+        exponent_num: u32::MAX,
+        exponent_den: 1,
+    };
+    assert!(matches!(
+        mock_init(deps.as_mut(), msg),
+        Err(ContractError::InvalidCurve { .. })
+    ));
+}
+
+#[test]
+fn curve_validation_rejects_sigmoid_without_bounded_domain() {
+    let mut deps = mock_dependencies();
+    let mut msg = linear_msg();
+    msg.curve_type = CurveType::Sigmoid {
+        amplitude: Uint128::one(),
+        amplitude_scale: 0,
+        steepness_num: 1,
+        steepness_den: 1,
+        midpoint: Uint128::zero(),
+        midpoint_scale: 0,
+    };
+    assert!(matches!(
+        mock_init(deps.as_mut(), msg),
+        Err(ContractError::InvalidCurve { .. })
+    ));
+}
+
 // ============================================================
 // C-1: update_curve rejection
 // ============================================================

@@ -20,6 +20,12 @@ pub enum ContractError {
     #[error("Unauthorized")]
     Unauthorized {},
 
+    #[error("Unapproved {kind} code id {code_id}")]
+    UnapprovedCode { kind: String, code_id: u64 },
+
+    #[error("Checksum mismatch for {kind} code id {code_id}")]
+    ChecksumMismatch { kind: String, code_id: u64 },
+
     #[error("Got a submessage reply with unknown id: {id}")]
     UnknownReplyId { id: u64 },
 }

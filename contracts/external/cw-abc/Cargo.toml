@@ -51,6 +51,7 @@ dao-interface = { workspace = true }
 getrandom = { workspace = true, features = ["js"] }
 thiserror = { workspace = true }
 cw-curves = { workspace = true }
+rust_decimal = { workspace = true }
 
 [dev-dependencies]
 speculoos = { workspace = true }

@@ -47,18 +47,18 @@ pub fn instantiate(
 
     phase_config.validate()?;
 
-    // H-5: bound token decimals. cw-curves uses `10u128.pow(decimals)`
+    // H-5: bound token decimals. rust_decimal supports at most scale 28.
     // internally; pow(38) ≈ 3.4e38 < u128::MAX, but pow(39) overflows.
     // Reject at instantiate so the contract is not bricked on first
     // buy or sell.
-    const MAX_DECIMALS: u8 = 38;
-    if supply.decimals >= MAX_DECIMALS {
+    const MAX_DECIMALS: u8 = 28;
+    if supply.decimals > MAX_DECIMALS {
         return Err(ContractError::InvalidDecimals {
             decimals: supply.decimals,
             max: MAX_DECIMALS,
         });
     }
-    if reserve.decimals >= MAX_DECIMALS {
+    if reserve.decimals > MAX_DECIMALS {
         return Err(ContractError::InvalidDecimals {
             decimals: reserve.decimals,
             max: MAX_DECIMALS,
@@ -83,7 +83,11 @@ pub fn instantiate(
         MAX_SUPPLY.save(deps.storage, &max_supply)?;
     }
 
-    // Save the curve type
+    curve_type.validate(
+        DecimalPlaces::new(supply.decimals, reserve.decimals),
+        supply.max_supply,
+    )?;
+    // Save the curve type only after comprehensive validation.
     CURVE_TYPE.save(deps.storage, &curve_type)?;
 
     PHASE_CONFIG.save(deps.storage, &phase_config)?;

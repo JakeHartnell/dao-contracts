@@ -2,7 +2,7 @@ use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{ensure, Decimal, Timestamp, Uint128};
 use cw_curves::{
     curves::{Constant, Linear, Power, Sigmoid, SquareRoot},
-    utils::decimal,
+    utils::{decimal, try_decimal},
     Curve, DecimalPlaces,
 };
 use dao_interface::token::NewDenomMetadata;
@@ -277,6 +277,130 @@ pub enum CurveType {
 }
 
 impl CurveType {
+    /// Validate all values before they can reach `rust_decimal` or bounded
+    /// iterative math. Sigmoid requires a maximum supply so both endpoints
+    /// of its supported domain can be proved to keep `|exp argument| <= 30`.
+    pub fn validate(
+        &self,
+        places: DecimalPlaces,
+        max_supply: Option<Uint128>,
+    ) -> Result<(), ContractError> {
+        const MAX_SCALE: u32 = 28;
+        const MAX_EXPONENT_WORK: u32 = 32;
+        ensure!(
+            places.supply <= MAX_SCALE && places.reserve <= MAX_SCALE,
+            ContractError::InvalidCurve {
+                reason: "token decimals exceed rust_decimal precision (28)".into()
+            }
+        );
+        let positive = |value: Uint128,
+                        scale: u32,
+                        name: &str|
+         -> Result<rust_decimal::Decimal, ContractError> {
+            ensure!(
+                scale <= MAX_SCALE,
+                ContractError::InvalidCurve {
+                    reason: format!("{name} scale exceeds 28")
+                }
+            );
+            let value = try_decimal(value, scale)?;
+            ensure!(
+                !value.is_zero(),
+                ContractError::InvalidCurve {
+                    reason: format!("{name} must be positive")
+                }
+            );
+            Ok(value)
+        };
+        match self {
+            CurveType::Constant { value, scale } => {
+                positive(*value, *scale, "value")?;
+            }
+            CurveType::Linear { slope, scale } | CurveType::SquareRoot { slope, scale } => {
+                positive(*slope, *scale, "slope")?;
+            }
+            CurveType::Power {
+                slope,
+                scale,
+                exponent_num,
+                exponent_den,
+            } => {
+                positive(*slope, *scale, "slope")?;
+                ensure!(
+                    *exponent_den > 0,
+                    ContractError::InvalidCurve {
+                        reason: "power denominator must be positive".into()
+                    }
+                );
+                let sum = exponent_num.checked_add(*exponent_den).ok_or_else(|| {
+                    ContractError::InvalidCurve {
+                        reason: "power exponent sum overflows".into(),
+                    }
+                })?;
+                ensure!(
+                    *exponent_num <= MAX_EXPONENT_WORK
+                        && *exponent_den <= MAX_EXPONENT_WORK
+                        && sum <= MAX_EXPONENT_WORK,
+                    ContractError::InvalidCurve {
+                        reason: "power numerator, denominator, and sum must be <= 32".into()
+                    }
+                );
+            }
+            CurveType::Sigmoid {
+                amplitude,
+                amplitude_scale,
+                steepness_num,
+                steepness_den,
+                midpoint,
+                midpoint_scale,
+            } => {
+                positive(*amplitude, *amplitude_scale, "amplitude")?;
+                ensure!(
+                    *steepness_num > 0
+                        && *steepness_den > 0
+                        && *steepness_num <= MAX_EXPONENT_WORK
+                        && *steepness_den <= MAX_EXPONENT_WORK,
+                    ContractError::InvalidCurve {
+                        reason: "sigmoid steepness numerator/denominator must be in 1..=32".into()
+                    }
+                );
+                ensure!(
+                    *midpoint_scale <= MAX_SCALE,
+                    ContractError::InvalidCurve {
+                        reason: "midpoint scale exceeds 28".into()
+                    }
+                );
+                let midpoint = try_decimal(*midpoint, *midpoint_scale)?;
+                let max = max_supply.ok_or_else(|| ContractError::InvalidCurve {
+                    reason: "sigmoid requires max_supply".into(),
+                })?;
+                let max = try_decimal(max, places.supply)?;
+                let steepness = rust_decimal::Decimal::from(*steepness_num)
+                    / rust_decimal::Decimal::from(*steepness_den);
+                for endpoint in [rust_decimal::Decimal::ZERO, max] {
+                    let distance = if endpoint >= midpoint {
+                        endpoint - midpoint
+                    } else {
+                        midpoint - endpoint
+                    };
+                    let argument = steepness.checked_mul(distance).ok_or_else(|| {
+                        ContractError::InvalidCurve {
+                            reason: "sigmoid endpoint overflows".into(),
+                        }
+                    })?;
+                    ensure!(
+                        argument <= rust_decimal::Decimal::from(30u32),
+                        ContractError::InvalidCurve {
+                            reason: "sigmoid endpoint exceeds supported |exponent| <= 30 domain"
+                                .into()
+                        }
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_curve_fn(&self) -> CurveFn {
         match self.clone() {
             CurveType::Constant { value, scale } => {

@@ -27,7 +27,7 @@ impl Curve for Constant {
     /// Note that both need to be normalized.
     fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
         // f(x) = supply * self.value
-        let reserve = self.normalize.from_supply(supply) * self.value;
+        let reserve = self.normalize.from_supply(supply)? * self.value;
         self.normalize.to_reserve(reserve)
     }
 
@@ -36,7 +36,7 @@ impl Curve for Constant {
         if self.value.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        let supply = self.normalize.from_reserve(reserve) / self.value;
+        let supply = self.normalize.from_reserve(reserve)? / self.value;
         self.normalize.to_supply(supply)
     }
 }

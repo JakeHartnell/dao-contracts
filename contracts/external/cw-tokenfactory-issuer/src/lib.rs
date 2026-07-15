@@ -1,5 +1,18 @@
 #![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
 
+#[cfg(not(any(
+    feature = "osmosis_tokenfactory",
+    feature = "cosmwasm_tokenfactory",
+    feature = "thorchain_tokenfactory"
+)))]
+compile_error!("enable exactly one tokenfactory backend feature");
+#[cfg(any(
+    all(feature = "osmosis_tokenfactory", feature = "cosmwasm_tokenfactory"),
+    all(feature = "osmosis_tokenfactory", feature = "thorchain_tokenfactory"),
+    all(feature = "cosmwasm_tokenfactory", feature = "thorchain_tokenfactory")
+))]
+compile_error!("tokenfactory backend features are mutually exclusive");
+
 /// The smart contract itself, including the execute, instantiate, query, migrate
 /// and reply entry points
 pub mod contract;

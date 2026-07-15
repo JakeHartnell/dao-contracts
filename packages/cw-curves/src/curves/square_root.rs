@@ -21,14 +21,14 @@ impl SquareRoot {
 impl Curve for SquareRoot {
     fn spot_price(&self, supply: Uint128) -> Result<StdDecimal, CurveError> {
         // f(x) = self.slope * supply^0.5
-        let square = self.normalize.from_supply(supply);
+        let square = self.normalize.from_supply(supply)?;
         let root = square_root(square)?;
         decimal_to_std(root * self.slope)
     }
 
     fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
         // f(x) = self.slope * supply * supply^0.5 / 1.5
-        let normalized = self.normalize.from_supply(supply);
+        let normalized = self.normalize.from_supply(supply)?;
         let root = square_root(normalized)?;
         let reserve = self.slope * normalized * root / Decimal::new(15, 1);
         self.normalize.to_reserve(reserve)
@@ -39,7 +39,7 @@ impl Curve for SquareRoot {
         if self.slope.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        let base = self.normalize.from_reserve(reserve) * Decimal::new(15, 1) / self.slope;
+        let base = self.normalize.from_reserve(reserve)? * Decimal::new(15, 1) / self.slope;
         let squared = base * base;
         let supply = cube_root(squared)?;
         self.normalize.to_supply(supply)

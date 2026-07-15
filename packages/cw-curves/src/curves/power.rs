@@ -23,6 +23,8 @@ pub struct Power {
 }
 
 impl Power {
+    const MAX_EXPONENT_WORK: u32 = 32;
+
     pub fn new(
         slope: Decimal,
         exponent_num: u32,
@@ -38,25 +40,46 @@ impl Power {
     }
 
     /// (num + den) / den, used in integral and inverse.
-    fn integral_num(&self) -> u32 {
-        self.exponent_num + self.exponent_den
+    fn integral_num(&self) -> Result<u32, CurveError> {
+        let sum = self
+            .exponent_num
+            .checked_add(self.exponent_den)
+            .ok_or_else(|| CurveError::InvalidConfiguration {
+                reason: "power exponent sum overflows".into(),
+            })?;
+        if self.exponent_den == 0
+            || self.exponent_num > Self::MAX_EXPONENT_WORK
+            || self.exponent_den > Self::MAX_EXPONENT_WORK
+            || sum > Self::MAX_EXPONENT_WORK
+        {
+            return Err(CurveError::InvalidConfiguration {
+                reason: "power denominator must be positive and exponent work must be <= 32".into(),
+            });
+        }
+        Ok(sum)
+    }
+
+    fn validate_exponents(&self) -> Result<(), CurveError> {
+        self.integral_num().map(|_| ())
     }
 }
 
 impl Curve for Power {
     fn spot_price(&self, supply: Uint128) -> Result<StdDecimal, CurveError> {
+        self.validate_exponents()?;
         // f(x) = slope * supply^(num/den)
-        let s = self.normalize.from_supply(supply);
+        let s = self.normalize.from_supply(supply)?;
         let powered = pow_rational(s, self.exponent_num, self.exponent_den)?;
         decimal_to_std(self.slope * powered)
     }
 
     fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
         // F(s) = slope * den / (num + den) * s^((num + den) / den)
-        let s = self.normalize.from_supply(supply);
-        let powered = pow_rational(s, self.integral_num(), self.exponent_den)?;
+        let s = self.normalize.from_supply(supply)?;
+        let integral_num = self.integral_num()?;
+        let powered = pow_rational(s, integral_num, self.exponent_den)?;
         let coefficient =
-            self.slope * Decimal::from(self.exponent_den) / Decimal::from(self.integral_num());
+            self.slope * Decimal::from(self.exponent_den) / Decimal::from(integral_num);
         self.normalize.to_reserve(coefficient * powered)
     }
 
@@ -65,14 +88,15 @@ impl Curve for Power {
         if self.slope.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
-        let r = self.normalize.from_reserve(reserve);
-        let numerator = Decimal::from(self.integral_num()) * r;
+        let r = self.normalize.from_reserve(reserve)?;
+        let integral_num = self.integral_num()?;
+        let numerator = Decimal::from(integral_num) * r;
         let denominator = self.slope * Decimal::from(self.exponent_den);
         if denominator.is_zero() {
             return Err(CurveError::DivisionByZero);
         }
         let base = numerator / denominator;
-        let supply = pow_rational(base, self.exponent_den, self.integral_num())?;
+        let supply = pow_rational(base, self.exponent_den, integral_num)?;
         self.normalize.to_supply(supply)
     }
 }

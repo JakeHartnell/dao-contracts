@@ -899,6 +899,7 @@ pub fn update_curve(
     phase.expect_closed()?;
 
     let curve_state = CURVE_STATE.load(deps.storage)?;
+    curve_type.validate(curve_state.decimals, MAX_SUPPLY.may_load(deps.storage)?)?;
     let new_curve = curve_type.to_curve_fn()(curve_state.decimals);
     let new_reserve_at_supply = new_curve.reserve(curve_state.supply)?;
 

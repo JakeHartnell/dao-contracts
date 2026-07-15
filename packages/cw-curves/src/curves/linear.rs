@@ -21,14 +21,19 @@ impl Linear {
 impl Curve for Linear {
     fn spot_price(&self, supply: Uint128) -> Result<StdDecimal, CurveError> {
         // f(x) = supply * self.value
-        let out = self.normalize.from_supply(supply) * self.slope;
+        let out = self.normalize.from_supply(supply)? * self.slope;
         decimal_to_std(out)
     }
 
     fn reserve(&self, supply: Uint128) -> Result<Uint128, CurveError> {
         // f(x) = self.slope * supply * supply / 2
-        let normalized = self.normalize.from_supply(supply);
-        let square = normalized * normalized;
+        let normalized = self.normalize.from_supply(supply)?;
+        let square = normalized
+            .checked_mul(normalized)
+            .ok_or_else(|| CurveError::Overflow {
+                scale: self.normalize.supply,
+                value: supply.to_string(),
+            })?;
         // Note: multiplying by 0.5 is much faster than dividing by 2
         let reserve = square * self.slope * Decimal::new(5, 1);
         self.normalize.to_reserve(reserve)
@@ -40,7 +45,13 @@ impl Curve for Linear {
             return Err(CurveError::DivisionByZero);
         }
         // note: use addition here to optimize 2* operation
-        let square = self.normalize.from_reserve(reserve + reserve) / self.slope;
+        let doubled = reserve
+            .checked_add(reserve)
+            .map_err(|_| CurveError::Overflow {
+                scale: self.normalize.reserve,
+                value: reserve.to_string(),
+            })?;
+        let square = self.normalize.from_reserve(doubled)? / self.slope;
         let supply = square_root(square)?;
         self.normalize.to_supply(supply)
     }

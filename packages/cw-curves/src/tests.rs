@@ -5,11 +5,60 @@ use cosmwasm_std::{Decimal as StdDecimal, Uint128};
 
 use crate::{
     curves::{Constant, Linear, Power, Sigmoid, SquareRoot},
-    utils::{decimal, taylor_exp},
+    utils::{decimal, taylor_exp, try_decimal},
     Curve, DecimalPlaces,
 };
 use rust_decimal::Decimal;
 use std::str::FromStr;
+
+#[test]
+fn decimal_rejects_unsupported_scale_and_coefficient_without_panicking() {
+    assert!(matches!(
+        try_decimal(1u128, 29),
+        Err(crate::CurveError::Overflow { scale: 29, .. })
+    ));
+    assert!(matches!(
+        try_decimal(1u128 << 96, 0),
+        Err(crate::CurveError::Overflow { scale: 0, .. })
+    ));
+}
+
+#[test]
+fn power_rejects_huge_exponents_in_bounded_time() {
+    let curve = Power::new(Decimal::ONE, u32::MAX, 1, DecimalPlaces::new(0, 0));
+    assert!(matches!(
+        curve.spot_price(Uint128::new(2)),
+        Err(crate::CurveError::InvalidConfiguration { .. })
+    ));
+}
+
+#[test]
+fn sigmoid_rejects_values_outside_exponential_domain() {
+    let curve = Sigmoid::new(
+        Decimal::ONE,
+        Decimal::ONE,
+        Decimal::ZERO,
+        DecimalPlaces::new(0, 0),
+    );
+    assert!(matches!(
+        curve.spot_price(Uint128::new(31)),
+        Err(crate::CurveError::InvalidConfiguration { .. })
+    ));
+}
+
+#[test]
+fn sigmoid_reports_non_convergence_instead_of_returning_an_approximation() {
+    let curve = Sigmoid::new(
+        Decimal::ONE,
+        Decimal::ONE,
+        Decimal::from(30u32),
+        DecimalPlaces::new(0, 0),
+    );
+    assert!(matches!(
+        curve.supply_with_iterations(Uint128::new(1), 0),
+        Err(crate::CurveError::NonConvergence { .. })
+    ));
+}
 
 #[test]
 fn constant_curve() {
@@ -300,7 +349,10 @@ fn taylor_exp_two_point_five() {
 #[test]
 fn taylor_exp_rejects_too_large() {
     let res = taylor_exp(Decimal::from(50u32));
-    assert!(matches!(res, Err(crate::CurveError::Overflow { .. })));
+    assert!(matches!(
+        res,
+        Err(crate::CurveError::InvalidConfiguration { .. })
+    ));
 }
 
 // ============================================================

@@ -16,12 +16,21 @@ use crate::CurveError;
 /// for any realistic Uint128 supply/reserve, but the panic is preferable to
 /// silently returning a wrong-signed Decimal.
 pub fn decimal<T: Into<u128>>(num: T, scale: u32) -> Decimal {
-    let n: u128 = num.into();
-    assert!(
-        n <= i128::MAX as u128,
-        "cw-curves::decimal overflow: value exceeds i128::MAX"
-    );
-    Decimal::from_i128_with_scale(n as i128, scale)
+    try_decimal(num, scale).expect("decimal literal must fit rust_decimal")
+}
+
+/// Fallible conversion for contract-reachable values. `rust_decimal` stores
+/// a 96-bit coefficient and supports at most 28 fractional digits.
+pub fn try_decimal<T: Into<u128>>(num: T, scale: u32) -> Result<Decimal, CurveError> {
+    let n = num.into();
+    let signed = i128::try_from(n).map_err(|_| CurveError::Overflow {
+        scale,
+        value: n.to_string(),
+    })?;
+    Decimal::try_from_i128_with_scale(signed, scale).map_err(|_| CurveError::Overflow {
+        scale,
+        value: n.to_string(),
+    })
 }
 
 /// StdDecimal stores as a u128 with 18 decimal points of precision.
@@ -242,9 +251,8 @@ pub(crate) fn taylor_exp(x: Decimal) -> Result<Decimal, CurveError> {
     }
     let abs = if x.is_sign_negative() { -x } else { x };
     if abs > Decimal::from(30u32) {
-        return Err(CurveError::Overflow {
-            scale: 0,
-            value: format!("taylor_exp |x| > 30: {}", x),
+        return Err(CurveError::InvalidConfiguration {
+            reason: format!("exponential argument must satisfy |x| <= 30: {x}"),
         });
     }
     // Euler's constant to 28 decimal digits.
