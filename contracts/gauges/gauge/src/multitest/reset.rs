@@ -422,14 +422,8 @@ fn partial_reset() {
         )
         .unwrap();
 
-    // Reset is the bounded garbage-collection path for removal tombstones and
-    // their still-referencing vote records.
-    suite
-        .remove_option(&gauge_contract, "owner", gauge_id, voter1)
-        .unwrap();
-    let before_reset = suite.query_gauge_health(&gauge_contract, gauge_id).unwrap();
-    assert_eq!(before_reset.invalid_option_count, 1);
-    assert!(before_reset.consistent);
+    // Both active options remain so a batch size of one exercises the
+    // in-progress reset state.
 
     // start resetting
     suite.advance_time(RESET_EPOCH);
@@ -461,10 +455,16 @@ fn partial_reset() {
     // Exactly one remaining option is completed by the second size-1 batch;
     // the stable cursor must not revisit the first zeroed option.
     let options = suite.query_list_options(&gauge_contract, gauge_id).unwrap();
-    assert_eq!(options, vec![(voter2.to_owned(), Uint128::zero())]);
+    assert_eq!(
+        options,
+        vec![
+            (voter1.to_owned(), Uint128::zero()),
+            (voter2.to_owned(), Uint128::zero()),
+        ]
+    );
     let after_reset = suite.query_gauge_health(&gauge_contract, gauge_id).unwrap();
     assert_eq!(after_reset.invalid_option_count, 0);
-    assert_eq!(after_reset.option_count, 1);
+    assert_eq!(after_reset.option_count, 2);
     assert!(after_reset.consistent);
     suite
         .place_vote(&gauge_contract, voter1, gauge_id, Some(voter2.to_owned()))

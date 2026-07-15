@@ -253,8 +253,7 @@ fn remove_option() {
     );
 
     // Remove an option with an active voter. It disappears from selection
-    // immediately, while its tombstone lets replacement subtract the old
-    // contribution without underflow.
+    // immediately, and replacement ignores the now-absent historical option.
     suite
         .place_vote(
             &gauge_contract,
@@ -330,14 +329,12 @@ fn remove_option() {
     let health = suite.query_gauge_health(&gauge_contract, gauge_id).unwrap();
     assert!(health.scan_complete);
     assert!(health.consistent);
-    // Both removed entries remain tombstoned, including the zero-valued one,
-    // until reset proves it is safe to garbage-collect stored references.
-    assert_eq!(health.option_count, 4);
+    assert_eq!(health.option_count, 2);
     assert_eq!(health.active_option_count, 2);
-    assert_eq!(health.invalid_option_count, 2);
+    assert_eq!(health.invalid_option_count, 0);
     assert_eq!(health.indexed_option_count, 2);
-    assert_eq!(health.tally_sum, Uint128::new(300));
-    assert_eq!(health.total_cast, Uint128::new(300));
+    assert_eq!(health.tally_sum, Uint128::new(100));
+    assert_eq!(health.total_cast, Uint128::new(100));
     assert_eq!(health.mismatch_count, 0);
 
     // Epoch execution pull-checks adapter validity and pays only the remaining
@@ -346,9 +343,9 @@ fn remove_option() {
     suite
         .execute_options(&gauge_contract, voter1, gauge_id)
         .unwrap();
-    // Only one third of total voting power remains cast, so the other two
-    // thirds stay unallocated under the burn-excess policy.
-    assert_eq!(suite.query_balance(voter1, "ujuno").unwrap(), 333);
+    // Removed voting power is subtracted from TOTAL_CAST, so the sole
+    // remaining active option receives the full allocation.
+    assert_eq!(suite.query_balance(voter1, "ujuno").unwrap(), 1000);
     assert_eq!(suite.query_balance(voter2, "ujuno").unwrap(), 0);
 }
 
@@ -401,8 +398,8 @@ fn removed_option_survives_real_cw4_power_hook_and_vote_replacement() {
         .unwrap();
     suite.remove_option(&gauge, owner, 0, voter).unwrap();
 
-    // Updating the member exercises the real CW4 hook against the retained
-    // tombstone. It must neither underflow nor restore the removed index.
+    // Updating the member exercises the real CW4 hook against a stored vote
+    // for an absent option. It must neither underflow nor recreate the option.
     let changed = suite
         .force_update_members(
             vec![],
@@ -434,7 +431,7 @@ fn removed_option_survives_real_cw4_power_hook_and_vote_replacement() {
     );
     let health = suite.query_gauge_health(&gauge, 0).unwrap();
     assert!(health.consistent);
-    assert_eq!(health.invalid_option_count, 1);
+    assert_eq!(health.invalid_option_count, 0);
 }
 
 #[test]
@@ -469,8 +466,7 @@ fn removal_handles_zero_and_many_active_voters() {
         )
         .unwrap();
 
-    // Even a zero tally must be tombstoned: the aggregate does not prove that
-    // no stored zero-power vote references the option and could later restake.
+    // A zero-tally option is deleted without retaining unbounded tombstones.
     suite.remove_option(&gauge, owner, 0, "unused").unwrap();
 
     // All three voters reference the same option before it is removed.
@@ -486,8 +482,8 @@ fn removal_handles_zero_and_many_active_voters() {
     suite.remove_option(&gauge, owner, 0, "crowded").unwrap();
     assert!(suite.query_selected_set(&gauge, 0).unwrap().is_empty());
 
-    // Replacing two votes and explicitly abstaining the third drains every
-    // retained reference without underflowing either tally or total cast.
+    // Replacing two votes and explicitly abstaining the third ignores the
+    // absent historical option without underflowing tally or total cast.
     for voter in &voters[..2] {
         suite
             .place_vote(&gauge, *voter, 0, Some("replacement".to_owned()))
@@ -500,9 +496,7 @@ fn removal_handles_zero_and_many_active_voters() {
     );
     let health = suite.query_gauge_health(&gauge, 0).unwrap();
     assert!(health.consistent);
-    // Both removals remain tombstoned until reset. This bounded cleanup point
-    // is what proves any old voter records are expired before deleting them.
-    assert_eq!(health.invalid_option_count, 2);
+    assert_eq!(health.invalid_option_count, 0);
     assert_eq!(health.total_cast, Uint128::new(300));
     assert_eq!(health.tally_sum, Uint128::new(300));
 }

@@ -215,7 +215,7 @@ mod health_query_tests {
     }
 
     #[test]
-    fn removing_zero_tally_tombstones_option_across_restake() {
+    fn removing_zero_tally_stays_removed_across_restake() {
         use crate::state::{Vote, WeightedVotes};
         use dao_hooks::stake::StakeChangedHookMsg;
 
@@ -254,8 +254,8 @@ mod health_query_tests {
             "removed".to_owned(),
         )
         .unwrap();
-        assert!(TALLY.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
-        assert!(INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
+        assert!(!TALLY.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
+        assert!(!INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
 
         execute::stake_changed(
             deps.as_mut(),
@@ -269,14 +269,138 @@ mod health_query_tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            TALLY
-                .load(deps.as_ref().storage, (GAUGE_ID, "removed"))
-                .unwrap(),
-            50
-        );
-        assert!(INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
+        assert!(!TALLY.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
+        assert!(!INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, "removed")));
         assert!(!OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 50, "removed")));
+    }
+
+    #[test]
+    fn non_resetting_gauge_reclaims_option_capacity_without_tombstones() {
+        use crate::state::{Vote, WeightedVotes};
+        use dao_hooks::stake::StakeChangedHookMsg;
+
+        const GAUGE_ID: u64 = 7;
+        let mut deps = mock_dependencies();
+        let hook = Addr::unchecked("staking-hook");
+        let voter = Addr::unchecked("alice");
+        CONFIG
+            .save(deps.as_mut().storage, &test_config(&hook))
+            .unwrap();
+        GAUGES
+            .save(deps.as_mut().storage, GAUGE_ID, &test_gauge(None))
+            .unwrap();
+        for index in 0..MAX_OPTIONS_PER_GAUGE {
+            update_tally(
+                deps.as_mut().storage,
+                GAUGE_ID,
+                &format!("option-{index:03}"),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        let removed = "option-000";
+        votes()
+            .save(
+                deps.as_mut().storage,
+                &voter,
+                GAUGE_ID,
+                &WeightedVotes {
+                    gauge_id: GAUGE_ID,
+                    power: Uint128::zero(),
+                    votes: vec![Vote {
+                        option: removed.to_owned(),
+                        weight: Decimal::one(),
+                    }],
+                    cast: Some(mock_env().block.time.seconds()),
+                },
+            )
+            .unwrap();
+
+        execute::remove_option(
+            deps.as_mut(),
+            Addr::unchecked("owner"),
+            GAUGE_ID,
+            removed.to_owned(),
+        )
+        .unwrap();
+        deps.querier.update_wasm(|query| match query {
+            WasmQuery::Smart { contract_addr, .. } if contract_addr == "adapter" => {
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&CheckOptionResponse { valid: true }).unwrap(),
+                ))
+            }
+            WasmQuery::Smart { contract_addr, .. } if contract_addr == "voting-powers" => {
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&VotingPowerAtHeightResponse {
+                        power: Uint128::one(),
+                        height: 1,
+                    })
+                    .unwrap(),
+                ))
+            }
+            _ => unreachable!(),
+        });
+
+        execute::add_option(
+            deps.as_mut(),
+            voter.clone(),
+            GAUGE_ID,
+            "replacement".to_owned(),
+        )
+        .unwrap();
+        assert!(!TALLY.has(deps.as_ref().storage, (GAUGE_ID, removed)));
+        assert!(!INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, removed)));
+        assert!(OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 0, "replacement")));
+
+        execute::stake_changed(
+            deps.as_mut(),
+            MessageInfo {
+                sender: hook,
+                funds: vec![],
+            },
+            StakeChangedHookMsg::Stake {
+                addr: voter,
+                amount: Uint128::new(50),
+            },
+        )
+        .unwrap();
+        assert!(!TALLY.has(deps.as_ref().storage, (GAUGE_ID, removed)));
+        assert!(!INVALID_OPTIONS.has(deps.as_ref().storage, (GAUGE_ID, removed)));
+        assert!(!OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 50, removed)));
+        assert!(OPTION_BY_POINTS.has(deps.as_ref().storage, (GAUGE_ID, 0, "replacement")));
+        assert_eq!(
+            OPTION_BY_POINTS
+                .sub_prefix(GAUGE_ID)
+                .keys(deps.as_ref().storage, None, None, Order::Ascending)
+                .count(),
+            MAX_OPTIONS_PER_GAUGE
+        );
+    }
+
+    #[test]
+    fn removing_option_removes_its_points_from_total_cast() {
+        const GAUGE_ID: u64 = 7;
+        let mut deps = mock_dependencies();
+        CONFIG
+            .save(
+                deps.as_mut().storage,
+                &test_config(&Addr::unchecked("hook")),
+            )
+            .unwrap();
+        update_tally(deps.as_mut().storage, GAUGE_ID, "removed", 0, 0).unwrap();
+        update_tally(deps.as_mut().storage, GAUGE_ID, "removed", 0, 50).unwrap();
+
+        execute::remove_option(
+            deps.as_mut(),
+            Addr::unchecked("owner"),
+            GAUGE_ID,
+            "removed".to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(TOTAL_CAST.load(&deps.storage, GAUGE_ID).unwrap(), 0);
+        assert!(!TALLY.has(&deps.storage, (GAUGE_ID, "removed")));
     }
 
     #[test]
@@ -1242,6 +1366,7 @@ mod execute {
                 let updates: Vec<_> = vote
                     .votes
                     .iter()
+                    .filter(|v| TALLY.has(deps.storage, (vote.gauge_id, v.option.as_str())))
                     .map(|v| {
                         (
                             v.option.as_str(),
@@ -1297,6 +1422,7 @@ mod execute {
                     let updates: Vec<_> = vote
                         .votes
                         .iter()
+                        .filter(|v| TALLY.has(deps.storage, (vote.gauge_id, v.option.as_str())))
                         .map(|v| {
                             (
                                 v.option.as_str(),
@@ -1345,6 +1471,7 @@ mod execute {
                     let updates: Vec<_> = vote
                         .votes
                         .iter()
+                        .filter(|v| TALLY.has(deps.storage, (vote.gauge_id, v.option.as_str())))
                         .map(|v| {
                             (
                                 v.option.as_str(),
@@ -1406,6 +1533,7 @@ mod execute {
                     let updates: Vec<_> = vote
                         .votes
                         .iter()
+                        .filter(|v| TALLY.has(deps.storage, (vote.gauge_id, v.option.as_str())))
                         .map(|v| {
                             (
                                 v.option.as_str(),
@@ -1464,6 +1592,7 @@ mod execute {
                     let updates: Vec<_> = vote
                         .votes
                         .iter()
+                        .filter(|v| TALLY.has(deps.storage, (vote.gauge_id, v.option.as_str())))
                         .map(|v| {
                             (
                                 v.option.as_str(),
@@ -1764,10 +1893,20 @@ mod execute {
 
         let points = TALLY.load(deps.storage, (gauge_id, &option))?;
         OPTION_BY_POINTS.remove(deps.storage, (gauge_id, points, &option));
-        // A zero tally does not prove that no stored zero-power vote still
-        // references this option. Retain both the tally and tombstone until
-        // reset's bounded cleanup so a later power increase cannot reactivate it.
-        INVALID_OPTIONS.save(deps.storage, (gauge_id, &option), &true)?;
+        TALLY.remove(deps.storage, (gauge_id, &option));
+        // Defensive cleanup for tombstones created by earlier unreleased
+        // revisions of this branch.
+        INVALID_OPTIONS.remove(deps.storage, (gauge_id, &option));
+        TOTAL_CAST.update(
+            deps.storage,
+            gauge_id,
+            |total| -> Result<_, ContractError> {
+                total
+                    .unwrap_or_default()
+                    .checked_sub(points)
+                    .ok_or(ContractError::TotalCastUnderflow { gauge_id })
+            },
+        )?;
 
         Ok(Response::new()
             .add_attribute("action", "remove_option")
@@ -1890,8 +2029,11 @@ mod execute {
                 max: MAX_OPTION_BYTES,
             });
         }
-        let option_count = TALLY
-            .prefix(gauge_id)
+        // Tombstones remain in TALLY to keep stored zero-power votes from
+        // reactivating removed options. Capacity is the bounded active index,
+        // not that historical safety namespace.
+        let option_count = OPTION_BY_POINTS
+            .sub_prefix(gauge_id)
             .keys(deps.storage, None, None, Order::Ascending)
             .take(MAX_OPTIONS_PER_GAUGE + 1)
             .collect::<StdResult<Vec<_>>>()?
@@ -2110,6 +2252,7 @@ mod execute {
         let mut diff: HashMap<&str, (u128, u128)> = previous_vote
             .votes
             .iter()
+            .filter(|v| TALLY.has(deps.storage, (gauge_id, v.option.as_str())))
             .map(|v| (v.option.as_str(), ((power * v.weight).u128(), 0u128)))
             .collect();
         for v in new_votes.iter() {
