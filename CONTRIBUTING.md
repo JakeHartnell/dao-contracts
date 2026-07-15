@@ -63,12 +63,14 @@ from the repository root.
 
 ## Getting ready to make a PR
 
-Before making a PR, you'll need to do two things to get CI passing:
+Before making a PR, you'll need to do three things to get it ready for review:
 
 1. Generate schema files for the contracts.
 2. Generate Typescript interfaces from those schemas.
+3. Update [`CHANGELOG.md`](CHANGELOG.md) for externally relevant changes, or
+   explain in the PR why no changelog entry is needed.
 
-You can do both of these by running:
+You can generate the schemas and Typescript interfaces by running:
 ```sh
 just gen
 ```
