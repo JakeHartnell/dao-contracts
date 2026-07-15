@@ -3,7 +3,10 @@ use cosmwasm_std::{Addr, Decimal, Uint128};
 
 use crate::{
     abc::{CommonsPhase, CommonsPhaseConfig, CurveType, MinMax, ReserveToken, SupplyToken},
-    state::{HatcherAllowlistConfigType, HatcherAllowlistEntry, HatcherState},
+    state::{
+        HatchContributionsMigrationProgress, HatcherAllowlistConfigType, HatcherAllowlistEntry,
+        HatcherState,
+    },
 };
 
 #[cw_serde]
@@ -127,6 +130,9 @@ pub enum ExecuteMsg {
     /// unburned hatcher tokens for burning. Returns the hatcher's pro-rata
     /// share of `(reserve + funding)` snapshotted at AbortHatch time.
     ClaimRefund {},
+    /// Permissionlessly processes the next contract-defined bounded legacy
+    /// migration batch. The caller cannot select the batch size.
+    ContinueHatchContributionsMigration {},
 }
 
 #[cw_ownable::cw_ownable_query]
@@ -193,6 +199,9 @@ pub enum QueryMsg {
     /// Returns the address of the cw-tokenfactory-issuer contract
     #[returns(::cosmwasm_std::Addr)]
     TokenContract {},
+    /// Returns bounded legacy migration progress, or `None` when unlocked.
+    #[returns(Option<HatchContributionsMigrationProgress>)]
+    HatchContributionsMigrationStatus {},
 }
 
 #[cw_serde]

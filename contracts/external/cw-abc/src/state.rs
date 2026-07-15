@@ -174,6 +174,18 @@ pub const HATCHERS: Map<&Addr, HatcherState> = Map::new("hatchers");
 /// lifecycle transitions remain O(1).
 pub const TOTAL_HATCH_CONTRIBUTIONS: Item<Uint128> = Item::new("total_hatch_contributions");
 
+/// Cursor and subtotal for bounded reconstruction of legacy Hatch contributions.
+/// Its presence locks all ordinary executes until finalization.
+#[cw_serde]
+pub struct HatchContributionsMigrationProgress {
+    /// Last hatcher included in `partial_total`; pagination resumes strictly after it.
+    pub cursor: Option<Addr>,
+    pub partial_total: Uint128,
+}
+
+pub const HATCH_CONTRIBUTIONS_MIGRATION: Item<HatchContributionsMigrationProgress> =
+    Item::new("hatch_contributions_migration");
+
 /// Keep track of the donated amounts per user
 pub static DONATIONS: Map<&Addr, Uint128> = Map::new("donations");
 

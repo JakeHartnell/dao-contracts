@@ -17,11 +17,11 @@ use crate::abc::{CommonsPhase, CurveType, MinMax, VestingSchedule};
 use crate::commands;
 use crate::commands::insert_into_priority_queue;
 use crate::contract;
-use crate::msg::{InstantiateMsg, MigrateMsg, UpdatePhaseConfigMsg};
+use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, UpdatePhaseConfigMsg};
 use crate::state::{
     HatcherAllowlistConfig, HatcherAllowlistConfigType, HatcherAllowlistEntry, HatcherState,
-    RefundSnapshot, CURVE_STATE, CURVE_TYPE, HATCHERS, PHASE, PHASE_CONFIG, REFUND_SNAPSHOT,
-    SUPPLY_DENOM, TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
+    RefundSnapshot, CURVE_STATE, CURVE_TYPE, HATCHERS, HATCH_CONTRIBUTIONS_MIGRATION, PHASE,
+    PHASE_CONFIG, REFUND_SNAPSHOT, SUPPLY_DENOM, TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::testing::{default_instantiate_msg, mock_init, TEST_CREATOR, TEST_RESERVE_DENOM};
 use crate::ContractError;
@@ -119,41 +119,155 @@ fn update_max_supply_revalidates_stored_sigmoid_domain() {
 }
 
 #[test]
-fn migrate_reconstructs_missing_hatch_contribution_aggregate() {
+fn migrate_starts_bounded_hatch_contribution_migration_without_scanning() {
     let mut deps = mock_dependencies();
     mock_init(deps.as_mut(), linear_msg()).unwrap();
     TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
-    HATCHERS
-        .save(
-            &mut deps.storage,
-            &Addr::unchecked("one"),
-            &HatcherState {
-                contributed: Uint128::new(3),
-                ..HatcherState::default()
-            },
-        )
-        .unwrap();
-    HATCHERS
-        .save(
-            &mut deps.storage,
-            &Addr::unchecked("two"),
-            &HatcherState {
-                contributed: Uint128::new(4),
-                ..HatcherState::default()
-            },
-        )
-        .unwrap();
-    deps.querier.update_balance(
-        mock_env().contract.address,
-        vec![coin(7, TEST_RESERVE_DENOM)],
-    );
+    for index in 0..(contract::HATCH_MIGRATION_BATCH_SIZE + 5) {
+        HATCHERS
+            .save(
+                &mut deps.storage,
+                &Addr::unchecked(format!("hatcher{index:04}")),
+                &HatcherState {
+                    contributed: Uint128::one(),
+                    ..HatcherState::default()
+                },
+            )
+            .unwrap();
+    }
 
     contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
 
+    assert!(TOTAL_HATCH_CONTRIBUTIONS
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_none());
+    let progress = HATCH_CONTRIBUTIONS_MIGRATION.load(&deps.storage).unwrap();
+    assert_eq!(progress.cursor, None);
+    assert_eq!(progress.partial_total, Uint128::zero());
+}
+
+#[test]
+fn migration_locks_normal_executes_and_is_permissionless() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
+    contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
+
+    assert_eq!(
+        contract::execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("anyone", &[]),
+            ExecuteMsg::TogglePause {},
+        ),
+        Err(ContractError::MigrationInProgress {})
+    );
+    contract::execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ContinueHatchContributionsMigration {},
+    )
+    .unwrap();
+}
+
+#[test]
+fn multiple_fixed_batches_reconstruct_each_hatcher_exactly_once() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
+    let count = contract::HATCH_MIGRATION_BATCH_SIZE * 2 + 3;
+    for index in 0..count {
+        HATCHERS
+            .save(
+                &mut deps.storage,
+                &Addr::unchecked(format!("hatcher{index:04}")),
+                &HatcherState {
+                    contributed: Uint128::new(index as u128 + 1),
+                    ..HatcherState::default()
+                },
+            )
+            .unwrap();
+    }
+    let expected = Uint128::new((count as u128) * (count as u128 + 1) / 2);
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![coin(expected.u128(), TEST_RESERVE_DENOM)],
+    );
+    contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
+
+    for _ in 0..3 {
+        contract::execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("permissionless", &[]),
+            ExecuteMsg::ContinueHatchContributionsMigration {},
+        )
+        .unwrap();
+    }
+
     assert_eq!(
         TOTAL_HATCH_CONTRIBUTIONS.load(&deps.storage).unwrap(),
-        Uint128::new(7)
+        expected
     );
+    assert!(HATCH_CONTRIBUTIONS_MIGRATION
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        contract::execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("permissionless", &[]),
+            ExecuteMsg::ContinueHatchContributionsMigration {},
+        ),
+        Err(ContractError::NoMigrationInProgress {})
+    );
+}
+
+#[test]
+fn exact_full_batches_finalize_without_empty_followup() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
+    let count = contract::HATCH_MIGRATION_BATCH_SIZE * 2;
+    for index in 0..count {
+        HATCHERS
+            .save(
+                &mut deps.storage,
+                &Addr::unchecked(format!("exact{index:04}")),
+                &HatcherState {
+                    contributed: Uint128::one(),
+                    ..HatcherState::default()
+                },
+            )
+            .unwrap();
+    }
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![coin(count as u128, TEST_RESERVE_DENOM)],
+    );
+    contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
+
+    for _ in 0..2 {
+        contract::execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("permissionless", &[]),
+            ExecuteMsg::ContinueHatchContributionsMigration {},
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        TOTAL_HATCH_CONTRIBUTIONS.load(&deps.storage).unwrap(),
+        Uint128::new(count as u128)
+    );
+    assert!(HATCH_CONTRIBUTIONS_MIGRATION
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -190,7 +304,7 @@ fn migrate_rejects_legacy_unsafe_vesting() {
 }
 
 #[test]
-fn migrate_rejects_insolvent_active_hatch() {
+fn underfunded_final_batch_errors_and_remains_locked() {
     let mut deps = mock_dependencies();
     mock_init(deps.as_mut(), linear_msg()).unwrap();
     TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
@@ -205,8 +319,78 @@ fn migrate_rejects_insolvent_active_hatch() {
         )
         .unwrap();
 
-    // Contract balance remains zero, simulating legacy fees already forwarded.
-    assert!(contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).is_err());
+    contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
+    assert!(matches!(
+        contract::execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("anyone", &[]),
+            ExecuteMsg::ContinueHatchContributionsMigration {},
+        ),
+        Err(ContractError::InsufficientHatchEscrow { required, available })
+            if required == Uint128::new(7) && available.is_zero()
+    ));
+    assert!(HATCH_CONTRIBUTIONS_MIGRATION
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_some());
+    assert!(TOTAL_HATCH_CONTRIBUTIONS
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn migrate_existing_aggregate_still_checks_active_hatch_escrow() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    TOTAL_HATCH_CONTRIBUTIONS
+        .save(&mut deps.storage, &Uint128::new(9))
+        .unwrap();
+
+    assert!(matches!(
+        contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}),
+        Err(ContractError::InsufficientHatchEscrow { required, available })
+            if required == Uint128::new(9) && available.is_zero()
+    ));
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![coin(9, TEST_RESERVE_DENOM)],
+    );
+    contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
+    assert!(HATCH_CONTRIBUTIONS_MIGRATION
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn migrate_missing_aggregate_outside_hatch_needs_no_scan_or_lock() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
+    PHASE.save(&mut deps.storage, &CommonsPhase::Open).unwrap();
+    HATCHERS
+        .save(
+            &mut deps.storage,
+            &Addr::unchecked("legacy"),
+            &HatcherState {
+                contributed: Uint128::MAX,
+                ..HatcherState::default()
+            },
+        )
+        .unwrap();
+
+    contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
+
+    assert!(HATCH_CONTRIBUTIONS_MIGRATION
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_none());
+    assert!(TOTAL_HATCH_CONTRIBUTIONS
+        .may_load(&deps.storage)
+        .unwrap()
+        .is_none());
 }
 
 #[test]

@@ -54,6 +54,12 @@ pub enum ContractError {
         available: Uint128,
     },
 
+    #[error("Legacy Hatch contribution migration is in progress")]
+    MigrationInProgress {},
+
+    #[error("No legacy Hatch contribution migration is in progress")]
+    NoMigrationInProgress {},
+
     #[error(
         "New curve would imply reserve {new_reserve_at_current_supply} at current supply, \
          but recorded reserve is {current_reserve} (drift exceeds tolerance {tolerance})"

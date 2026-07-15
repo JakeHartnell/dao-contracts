@@ -6,6 +6,7 @@ use cosmwasm_std::{
 };
 use cw2::set_contract_version;
 use cw_curves::DecimalPlaces;
+use cw_storage_plus::Bound;
 use cw_tokenfactory_issuer::msg::{
     DenomUnit, ExecuteMsg as IssuerExecuteMsg, InstantiateMsg as IssuerInstantiateMsg, Metadata,
 };
@@ -15,9 +16,9 @@ use crate::abc::{CommonsPhase, CurveFn};
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 use crate::state::{
-    CurveState, CURVE_STATE, CURVE_TYPE, FUNDING_POOL_FORWARDING, HATCHERS, IS_PAUSED, MAX_SUPPLY,
-    PHASE, PHASE_CONFIG, SUPPLY_DENOM, TEMP_SUPPLY, TOKEN_ISSUER_CONTRACT,
-    TOTAL_HATCH_CONTRIBUTIONS,
+    CurveState, HatchContributionsMigrationProgress, CURVE_STATE, CURVE_TYPE,
+    FUNDING_POOL_FORWARDING, HATCHERS, HATCH_CONTRIBUTIONS_MIGRATION, IS_PAUSED, MAX_SUPPLY, PHASE,
+    PHASE_CONFIG, SUPPLY_DENOM, TEMP_SUPPLY, TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::{commands, queries};
 
@@ -26,6 +27,9 @@ pub(crate) const CONTRACT_NAME: &str = "crates.io:cw-abc";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const INSTANTIATE_TOKEN_FACTORY_ISSUER_REPLY_ID: u64 = 0;
+
+/// Hard protocol bound; callers cannot select an unbounded batch size.
+pub(crate) const HATCH_MIGRATION_BATCH_SIZE: usize = 100;
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
@@ -146,6 +150,18 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
+    // Continuation is permissionless and callable even while paused. Every
+    // ordinary execute remains locked while migration progress exists.
+    if matches!(msg, ExecuteMsg::ContinueHatchContributionsMigration {}) {
+        return continue_hatch_contributions_migration(deps, env);
+    }
+    if HATCH_CONTRIBUTIONS_MIGRATION
+        .may_load(deps.storage)?
+        .is_some()
+    {
+        return Err(ContractError::MigrationInProgress {});
+    }
+
     // If paused, then only the owner can perform actions
     if IS_PAUSED.load(deps.storage)? {
         cw_ownable::assert_owner(deps.storage, &info.sender)
@@ -183,6 +199,7 @@ pub fn execute(
         }
         ExecuteMsg::AbortHatch {} => commands::abort_hatch(deps, env, info),
         ExecuteMsg::ClaimRefund {} => commands::claim_refund(deps, env, info),
+        ExecuteMsg::ContinueHatchContributionsMigration {} => unreachable!(),
     }
 }
 
@@ -230,6 +247,9 @@ pub fn do_query(deps: Deps, _env: Env, msg: QueryMsg, curve_fn: CurveFn) -> StdR
         QueryMsg::PhaseConfig {} => to_json_binary(&queries::query_phase_config(deps)?),
         QueryMsg::Phase {} => to_json_binary(&PHASE.load(deps.storage)?),
         QueryMsg::TokenContract {} => to_json_binary(&TOKEN_ISSUER_CONTRACT.load(deps.storage)?),
+        QueryMsg::HatchContributionsMigrationStatus {} => {
+            to_json_binary(&HATCH_CONTRIBUTIONS_MIGRATION.may_load(deps.storage)?)
+        }
         QueryMsg::BuyQuote { payment } => to_json_binary(&queries::query_buy_quote(deps, payment)?),
         QueryMsg::SellQuote { payment } => {
             to_json_binary(&queries::query_sell_quote(deps, payment)?)
@@ -266,40 +286,94 @@ pub fn migrate(deps: DepsMut, env: Env, _msg: MigrateMsg) -> Result<Response, Co
         });
     }
 
-    let total_hatch_contributions =
-        if let Some(total) = TOTAL_HATCH_CONTRIBUTIONS.may_load(deps.storage)? {
-            total
-        } else {
-            // Older versions tracked only per-address contributions. Reconstruct
-            // the aggregate once during migration so all subsequent buys and
-            // lifecycle transitions remain O(1).
-            let total = HATCHERS
-                .range(deps.storage, None, None, Order::Ascending)
-                .try_fold(
-                    Uint128::zero(),
-                    |acc, item| -> Result<Uint128, ContractError> {
-                        let (_, hatcher) = item?;
-                        Ok(acc.checked_add(hatcher.contributed)?)
-                    },
-                )?;
-            TOTAL_HATCH_CONTRIBUTIONS.save(deps.storage, &total)?;
-            total
-        };
-
-    if matches!(&phase, CommonsPhase::Hatch) {
-        let retained = deps
-            .querier
-            .query_balance(env.contract.address, curve_state.reserve_denom)?;
-        if retained.amount < total_hatch_contributions {
-            return Err(ContractError::InsufficientHatchEscrow {
-                required: total_hatch_contributions,
-                available: retained.amount,
-            });
+    if let Some(total_hatch_contributions) = TOTAL_HATCH_CONTRIBUTIONS.may_load(deps.storage)? {
+        if matches!(&phase, CommonsPhase::Hatch) {
+            assert_hatch_escrow(deps.as_ref(), &env, &curve_state, total_hatch_contributions)?;
         }
+        // Heal a stale marker only after all synchronous active-Hatch checks.
+        HATCH_CONTRIBUTIONS_MIGRATION.remove(deps.storage);
+    } else if matches!(&phase, CommonsPhase::Hatch)
+        && HATCH_CONTRIBUTIONS_MIGRATION
+            .may_load(deps.storage)?
+            .is_none()
+    {
+        // Install without touching HATCHERS. Fixed-size permissionless calls
+        // reconstruct the aggregate after migration returns.
+        HATCH_CONTRIBUTIONS_MIGRATION.save(
+            deps.storage,
+            &HatchContributionsMigrationProgress {
+                cursor: None,
+                partial_total: Uint128::zero(),
+            },
+        )?;
     }
+    // A missing aggregate outside Hatch is irrelevant to future lifecycle
+    // operations and deliberately requires no legacy scan.
 
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     Ok(Response::default())
+}
+
+fn assert_hatch_escrow(
+    deps: Deps,
+    env: &Env,
+    curve_state: &CurveState,
+    required: Uint128,
+) -> Result<(), ContractError> {
+    let retained = deps
+        .querier
+        .query_balance(&env.contract.address, &curve_state.reserve_denom)?;
+    if retained.amount < required {
+        return Err(ContractError::InsufficientHatchEscrow {
+            required,
+            available: retained.amount,
+        });
+    }
+    Ok(())
+}
+
+fn continue_hatch_contributions_migration(
+    deps: DepsMut,
+    env: Env,
+) -> Result<Response, ContractError> {
+    let mut progress = HATCH_CONTRIBUTIONS_MIGRATION
+        .may_load(deps.storage)?
+        .ok_or(ContractError::NoMigrationInProgress {})?;
+    let start = progress.cursor.as_ref().map(Bound::exclusive);
+    let batch = HATCHERS
+        .range(deps.storage, start, None, Order::Ascending)
+        .take(HATCH_MIGRATION_BATCH_SIZE + 1)
+        .collect::<StdResult<Vec<_>>>()?;
+    let has_more = batch.len() > HATCH_MIGRATION_BATCH_SIZE;
+    let processed_len = batch.len().min(HATCH_MIGRATION_BATCH_SIZE);
+
+    for (_, hatcher) in batch.iter().take(processed_len) {
+        progress.partial_total = progress.partial_total.checked_add(hatcher.contributed)?;
+    }
+
+    if has_more {
+        // Read one bounded lookahead record so an exact multiple of the batch
+        // size can finalize without requiring an empty follow-up call. The
+        // cursor is the last processed key, never the lookahead key.
+        progress.cursor = batch.get(processed_len - 1).map(|(addr, _)| addr.clone());
+        HATCH_CONTRIBUTIONS_MIGRATION.save(deps.storage, &progress)?;
+        return Ok(Response::new()
+            .add_attribute("action", "continue_hatch_contributions_migration")
+            .add_attribute("processed", processed_len.to_string())
+            .add_attribute("complete", "false"));
+    }
+
+    // Check before writing either progress or aggregate. On an underfunded
+    // final batch, even direct unit-test storage remains at the prior cursor.
+    let curve_state = CURVE_STATE.load(deps.storage)?;
+    assert_hatch_escrow(deps.as_ref(), &env, &curve_state, progress.partial_total)?;
+    TOTAL_HATCH_CONTRIBUTIONS.save(deps.storage, &progress.partial_total)?;
+    HATCH_CONTRIBUTIONS_MIGRATION.remove(deps.storage);
+    Ok(Response::new()
+        .add_attribute("action", "continue_hatch_contributions_migration")
+        .add_attribute("processed", batch.len().to_string())
+        .add_attribute("complete", "true")
+        .add_attribute("total", progress.partial_total))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
