@@ -20,7 +20,7 @@ use crate::contract;
 use crate::msg::{InstantiateMsg, MigrateMsg, UpdatePhaseConfigMsg};
 use crate::state::{
     HatcherAllowlistConfig, HatcherAllowlistConfigType, HatcherAllowlistEntry, HatcherState,
-    RefundSnapshot, CURVE_STATE, HATCHERS, PHASE, REFUND_SNAPSHOT, SUPPLY_DENOM,
+    RefundSnapshot, CURVE_STATE, CURVE_TYPE, HATCHERS, PHASE, REFUND_SNAPSHOT, SUPPLY_DENOM,
     TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::testing::{default_instantiate_msg, mock_init, TEST_CREATOR, TEST_RESERVE_DENOM};
@@ -150,6 +150,26 @@ fn migrate_reconstructs_missing_hatch_contribution_aggregate() {
         TOTAL_HATCH_CONTRIBUTIONS.load(&deps.storage).unwrap(),
         Uint128::new(7)
     );
+}
+
+#[test]
+fn migrate_rejects_legacy_curve_outside_supported_domain() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    CURVE_TYPE
+        .save(
+            &mut deps.storage,
+            &CurveType::Constant {
+                value: Uint128::one(),
+                scale: 29,
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}),
+        Err(ContractError::InvalidCurve { .. })
+    ));
 }
 
 // ============================================================

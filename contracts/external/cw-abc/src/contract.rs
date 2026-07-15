@@ -250,6 +250,10 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
         });
     }
 
+    let curve_type = CURVE_TYPE.load(deps.storage)?;
+    let curve_state = CURVE_STATE.load(deps.storage)?;
+    curve_type.validate(curve_state.decimals, MAX_SUPPLY.may_load(deps.storage)?)?;
+
     if !TOTAL_HATCH_CONTRIBUTIONS.exists(deps.storage) {
         // Older versions tracked only per-address contributions. Reconstruct
         // the aggregate once during migration so all subsequent buys and
