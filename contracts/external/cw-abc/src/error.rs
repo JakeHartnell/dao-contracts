@@ -45,6 +45,12 @@ pub enum ContractError {
     )]
     UnsafeVestingConfiguration {},
 
+    #[error("Active Hatch escrow is underfunded: required {required}, available {available}")]
+    InsufficientHatchEscrow {
+        required: Uint128,
+        available: Uint128,
+    },
+
     #[error(
         "New curve would imply reserve {new_reserve_at_current_supply} at current supply, \
          but recorded reserve is {current_reserve} (drift exceeds tolerance {tolerance})"

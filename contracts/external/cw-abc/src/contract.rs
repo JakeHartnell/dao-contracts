@@ -238,7 +238,7 @@ pub fn do_query(deps: Deps, _env: Env, msg: QueryMsg, curve_fn: CurveFn) -> StdR
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+pub fn migrate(deps: DepsMut, env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
     // M-2: verify the stored cw2 contract name matches before overwriting.
     // Migrating from an unrelated contract type would silently overwrite
     // metadata otherwise.
@@ -253,21 +253,38 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
     let curve_type = CURVE_TYPE.load(deps.storage)?;
     let curve_state = CURVE_STATE.load(deps.storage)?;
     curve_type.validate(curve_state.decimals, MAX_SUPPLY.may_load(deps.storage)?)?;
+    PHASE_CONFIG.load(deps.storage)?.validate()?;
 
-    if !TOTAL_HATCH_CONTRIBUTIONS.exists(deps.storage) {
-        // Older versions tracked only per-address contributions. Reconstruct
-        // the aggregate once during migration so all subsequent buys and
-        // lifecycle transitions remain O(1).
-        let total = HATCHERS
-            .range(deps.storage, None, None, Order::Ascending)
-            .try_fold(
-                Uint128::zero(),
-                |acc, item| -> Result<Uint128, ContractError> {
-                    let (_, hatcher) = item?;
-                    Ok(acc.checked_add(hatcher.contributed)?)
-                },
-            )?;
-        TOTAL_HATCH_CONTRIBUTIONS.save(deps.storage, &total)?;
+    let total_hatch_contributions =
+        if let Some(total) = TOTAL_HATCH_CONTRIBUTIONS.may_load(deps.storage)? {
+            total
+        } else {
+            // Older versions tracked only per-address contributions. Reconstruct
+            // the aggregate once during migration so all subsequent buys and
+            // lifecycle transitions remain O(1).
+            let total = HATCHERS
+                .range(deps.storage, None, None, Order::Ascending)
+                .try_fold(
+                    Uint128::zero(),
+                    |acc, item| -> Result<Uint128, ContractError> {
+                        let (_, hatcher) = item?;
+                        Ok(acc.checked_add(hatcher.contributed)?)
+                    },
+                )?;
+            TOTAL_HATCH_CONTRIBUTIONS.save(deps.storage, &total)?;
+            total
+        };
+
+    if matches!(PHASE.load(deps.storage)?, CommonsPhase::Hatch) {
+        let retained = deps
+            .querier
+            .query_balance(env.contract.address, curve_state.reserve_denom)?;
+        if retained.amount < total_hatch_contributions {
+            return Err(ContractError::InsufficientHatchEscrow {
+                required: total_hatch_contributions,
+                available: retained.amount,
+            });
+        }
     }
 
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;

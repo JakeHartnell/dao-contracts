@@ -20,8 +20,8 @@ use crate::contract;
 use crate::msg::{InstantiateMsg, MigrateMsg, UpdatePhaseConfigMsg};
 use crate::state::{
     HatcherAllowlistConfig, HatcherAllowlistConfigType, HatcherAllowlistEntry, HatcherState,
-    RefundSnapshot, CURVE_STATE, CURVE_TYPE, HATCHERS, PHASE, REFUND_SNAPSHOT, SUPPLY_DENOM,
-    TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
+    RefundSnapshot, CURVE_STATE, CURVE_TYPE, HATCHERS, PHASE, PHASE_CONFIG, REFUND_SNAPSHOT,
+    SUPPLY_DENOM, TOKEN_ISSUER_CONTRACT, TOTAL_HATCH_CONTRIBUTIONS,
 };
 use crate::testing::{default_instantiate_msg, mock_init, TEST_CREATOR, TEST_RESERVE_DENOM};
 use crate::ContractError;
@@ -143,6 +143,10 @@ fn migrate_reconstructs_missing_hatch_contribution_aggregate() {
             },
         )
         .unwrap();
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![coin(7, TEST_RESERVE_DENOM)],
+    );
 
     contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).unwrap();
 
@@ -170,6 +174,39 @@ fn migrate_rejects_legacy_curve_outside_supported_domain() {
         contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}),
         Err(ContractError::InvalidCurve { .. })
     ));
+}
+
+#[test]
+fn migrate_rejects_legacy_unsafe_vesting() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    let mut config = PHASE_CONFIG.load(&deps.storage).unwrap();
+    config.vesting = VestingSchedule::Cliff {
+        duration_seconds: 60,
+    };
+    PHASE_CONFIG.save(&mut deps.storage, &config).unwrap();
+
+    assert!(contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).is_err());
+}
+
+#[test]
+fn migrate_rejects_insolvent_active_hatch() {
+    let mut deps = mock_dependencies();
+    mock_init(deps.as_mut(), linear_msg()).unwrap();
+    TOTAL_HATCH_CONTRIBUTIONS.remove(&mut deps.storage);
+    HATCHERS
+        .save(
+            &mut deps.storage,
+            &Addr::unchecked("one"),
+            &HatcherState {
+                contributed: Uint128::new(7),
+                ..HatcherState::default()
+            },
+        )
+        .unwrap();
+
+    // Contract balance remains zero, simulating legacy fees already forwarded.
+    assert!(contract::migrate(deps.as_mut(), mock_env(), MigrateMsg {}).is_err());
 }
 
 // ============================================================
