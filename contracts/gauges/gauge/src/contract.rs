@@ -1187,6 +1187,107 @@ mod health_query_tests {
     }
 
     #[test]
+    fn attachment_imports_all_options_when_adapter_clamps_page_size() {
+        const ADAPTER_PAGE_CAP: usize = 30;
+        const OPTION_COUNT: usize = 75;
+
+        let mut deps = mock_dependencies();
+        let adapter_options = (0..OPTION_COUNT)
+            .map(|index| format!("option-{index:03}"))
+            .collect::<Vec<_>>();
+        deps.querier.update_wasm(move |query| match query {
+            WasmQuery::Smart { msg, .. } => {
+                let AdapterQueryMsg::AllOptions { start_after, limit } = from_json(msg).unwrap()
+                else {
+                    unreachable!()
+                };
+                let start = start_after
+                    .and_then(|cursor| {
+                        adapter_options
+                            .iter()
+                            .position(|option| option == &cursor)
+                            .map(|index| index + 1)
+                    })
+                    .unwrap_or_default();
+                let options = adapter_options
+                    .iter()
+                    .skip(start)
+                    .take((limit.unwrap_or(30) as usize).min(ADAPTER_PAGE_CAP))
+                    .cloned()
+                    .collect();
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&AllOptionsResponse { options }).unwrap(),
+                ))
+            }
+            _ => unreachable!(),
+        });
+
+        let (gauge_id, _) = execute::attach_gauge(
+            deps.as_mut(),
+            mock_env(),
+            GaugeConfig {
+                title: "paginated import".to_owned(),
+                adapter: "adapter".to_owned(),
+                epoch_size: 600,
+                min_percent_selected: None,
+                max_options_selected: 10,
+                max_available_percentage: None,
+                reset_epoch: None,
+                snapshot_policy: None,
+            },
+        )
+        .unwrap();
+
+        let health = query::gauge_health(deps.as_ref(), gauge_id).unwrap();
+        assert_eq!(health.option_count, OPTION_COUNT as u32);
+        assert_eq!(health.indexed_option_count, OPTION_COUNT as u32);
+        assert!(health.scan_complete);
+        assert!(health.consistent);
+    }
+
+    #[test]
+    fn attachment_rejects_adapter_that_repeats_a_nonempty_page() {
+        let mut deps = mock_dependencies();
+        let hidden_options = (0..=MAX_OPTIONS_PER_GAUGE)
+            .map(|index| format!("option-{index:03}"))
+            .collect::<Vec<_>>();
+        deps.querier.update_wasm(move |query| match query {
+            WasmQuery::Smart { .. } => SystemResult::Ok(ContractResult::Ok(
+                to_json_binary(&AllOptionsResponse {
+                    // This malformed adapter has 101 options but ignores the
+                    // cursor and always repeats its first clamped page.
+                    options: hidden_options.iter().take(30).cloned().collect(),
+                })
+                .unwrap(),
+            )),
+            _ => unreachable!(),
+        });
+
+        let error = execute::attach_gauge(
+            deps.as_mut(),
+            mock_env(),
+            GaugeConfig {
+                title: "stalled pagination".to_owned(),
+                adapter: "adapter".to_owned(),
+                epoch_size: 600,
+                min_percent_selected: None,
+                max_options_selected: 10,
+                max_available_percentage: None,
+                reset_epoch: None,
+                snapshot_policy: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ContractError::AdapterPaginationStalled {});
+        assert!(GAUGES
+            .range(deps.as_ref().storage, None, None, Order::Ascending)
+            .next()
+            .is_none());
+        assert_eq!(fetch_last_id(deps.as_mut().storage).unwrap(), 0);
+    }
+
+    #[test]
     fn attachment_accepts_one_hundred_options_and_rejects_lookahead_101_atomically() {
         let config = GaugeConfig {
             title: "bounded import".to_owned(),
@@ -1258,7 +1359,7 @@ mod health_query_tests {
                 let options = over_options
                     .iter()
                     .skip(start)
-                    .take(limit.unwrap_or(30) as usize)
+                    .take((limit.unwrap_or(30) as usize).min(30))
                     .cloned()
                     .collect();
                 SystemResult::Ok(ContractResult::Ok(
@@ -1382,38 +1483,51 @@ mod execute {
 
     use super::*;
     use crate::state::{update_tallies, Reset, Vote};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     fn bounded_adapter_options(deps: Deps, adapter: &Addr) -> Result<Vec<String>, ContractError> {
-        let response: AllOptionsResponse = deps.querier.query_wasm_smart(
-            adapter,
-            &AdapterQueryMsg::AllOptions {
-                start_after: None,
-                limit: Some(MAX_OPTIONS_PER_GAUGE as u32),
-            },
-        )?;
-        if response.options.len() > MAX_OPTIONS_PER_GAUGE {
-            return Err(ContractError::TooManyOptions {
-                count: response.options.len(),
-                max: MAX_OPTIONS_PER_GAUGE,
-            });
-        }
-        if response.options.len() == MAX_OPTIONS_PER_GAUGE {
-            let lookahead: AllOptionsResponse = deps.querier.query_wasm_smart(
+        let mut options = Vec::with_capacity(MAX_OPTIONS_PER_GAUGE + 1);
+        let mut seen = HashSet::with_capacity(MAX_OPTIONS_PER_GAUGE + 1);
+        let mut start_after = None;
+
+        loop {
+            let remaining = MAX_OPTIONS_PER_GAUGE + 1 - options.len();
+            let response: AllOptionsResponse = deps.querier.query_wasm_smart(
                 adapter,
                 &AdapterQueryMsg::AllOptions {
-                    start_after: response.options.last().cloned(),
-                    limit: Some(1),
+                    start_after: start_after.clone(),
+                    limit: Some(remaining as u32),
                 },
             )?;
-            if !lookahead.options.is_empty() {
-                return Err(ContractError::TooManyOptions {
-                    count: MAX_OPTIONS_PER_GAUGE + 1,
-                    max: MAX_OPTIONS_PER_GAUGE,
-                });
+
+            if response.options.is_empty() {
+                return Ok(options);
+            }
+
+            let option_count_before_page = options.len();
+            for option in response.options {
+                start_after = Some(option.clone());
+                if !seen.insert(option.clone()) {
+                    continue;
+                }
+                options.push(option);
+
+                if options.len() > MAX_OPTIONS_PER_GAUGE {
+                    return Err(ContractError::TooManyOptions {
+                        count: MAX_OPTIONS_PER_GAUGE + 1,
+                        max: MAX_OPTIONS_PER_GAUGE,
+                    });
+                }
+            }
+
+            // A non-empty page must advance the unique option set. Otherwise
+            // the adapter may be ignoring the cursor or cycling, and treating
+            // the partial set as complete could silently omit valid options or
+            // hide that the adapter exceeds the hard option bound.
+            if options.len() == option_count_before_page {
+                return Err(ContractError::AdapterPaginationStalled {});
             }
         }
-        Ok(response.options)
     }
 
     pub fn member_changed(
