@@ -122,6 +122,9 @@ pub enum ContractError {
     #[error("Gauge has too many options: {count}; maximum is {max}")]
     TooManyOptions { count: usize, max: usize },
 
+    #[error("Gauge adapter option pagination did not advance")]
+    AdapterPaginationStalled {},
+
     #[error("Too many vote-hook subscribers; maximum is {max}")]
     TooManyHooks { max: u32 },
 

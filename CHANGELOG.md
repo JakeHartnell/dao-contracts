@@ -78,6 +78,9 @@ add the release or comparison link.
 
 ### Changed
 
+- Gauge attachment now follows adapter option pagination even when adapters
+  clamp requested page sizes, preventing valid projects after the first page
+  from being silently omitted while retaining the 100-option limit.
 - Preserved Cargo lockfile v3 compatibility across the combined gauge and ABC
   workspace so the gauge Rust/Cargo 1.81 path and the pinned ABC nightly remain
   reproducible.

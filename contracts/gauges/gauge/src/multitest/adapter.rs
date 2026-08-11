@@ -8,7 +8,7 @@ use cosmwasm_std::{
     Order, Response, StdError, StdResult,
 };
 use cw_multi_test::{Contract, ContractWrapper};
-use cw_storage_plus::{Item, Map};
+use cw_storage_plus::{Bound, Item, Map};
 use serde::{Deserialize, Serialize};
 
 use crate::msg::{
@@ -68,9 +68,15 @@ fn execute(
 
 fn query(deps: Deps, _env: Env, msg: AdapterQueryMsg) -> Result<Binary, StdError> {
     match msg {
-        AdapterQueryMsg::AllOptions { .. } => to_json_binary(&AllOptionsResponse {
+        AdapterQueryMsg::AllOptions { start_after, limit } => to_json_binary(&AllOptionsResponse {
             options: OPTIONS
-                .keys(deps.storage, None, None, Order::Ascending)
+                .keys(
+                    deps.storage,
+                    start_after.map(Bound::exclusive),
+                    None,
+                    Order::Ascending,
+                )
+                .take(limit.unwrap_or(100) as usize)
                 .collect::<StdResult<Vec<_>>>()?,
         }),
         AdapterQueryMsg::CheckOption { option } => to_json_binary(&CheckOptionResponse {
