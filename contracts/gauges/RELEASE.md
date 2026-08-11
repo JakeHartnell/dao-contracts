@@ -28,7 +28,8 @@ checksums, schemas, cw2 identities, source commit, optimizer image digest,
 audit report, and the chain-test evidence required by `GOAL.md`. A locally
 compiled or crates.io-published crate is not deployment approval.
 
-All release Wasm is capped at 800,000 bytes. The release validator also checks
+All release Wasm is capped at 800,000 bytes after the linker removes
+non-executable name/debug metadata (`-C link-arg=-s`). The release validator also checks
 the complete export allowlist: only orchestrator exports `reply`; orchestrator
 and marketing export `migrate`; allocator intentionally exports neither. This
 rejects accidental debug or entry-point exports in addition to

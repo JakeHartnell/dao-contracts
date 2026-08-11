@@ -51,6 +51,13 @@ add the release or comparison link.
 
 ### Added
 
+- Added an explicit epoch-snapshot power mode to the gauge orchestrator. Each
+  epoch fixes one historical total/voter-power height, tracks full turnout
+  separately from allocations, records terminal no-distribution outcomes,
+  supplies bounded budget context to adapters, supports bounded historical
+  queries/cleanup, and gives a guardian stop-only authority. Hook mode remains
+  the migration/default behavior; snapshot mode rejects hook configuration and
+  calls. Upstream review reference is pending.
 - Added `dao-voting-juno-staked`, a thin DAO DAO voting module backed by
   Juno's historical `x/voting-snapshot` queries. It requires Juno v30 (including
   the `uni-7` deployment target), translates DAO heights to the previous settled

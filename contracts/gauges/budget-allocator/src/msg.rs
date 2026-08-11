@@ -53,6 +53,9 @@ pub enum QueryMsg {
     SampleGaugeMsgs {
         /// Option + weight pairs, weights summing to ≤ 1.0.
         selected: Vec<(String, cosmwasm_std::Decimal)>,
+        epoch_budget: Option<cosmwasm_std::Uint128>,
+        available_balance: Option<cosmwasm_std::Uint128>,
+        denom: Option<String>,
     },
 }
 
@@ -82,6 +85,9 @@ mod schema_smoke_tests {
             },
             AdapterQueryMsg::SampleGaugeMsgs {
                 selected: vec![("recipient".to_owned(), cosmwasm_std::Decimal::percent(50))],
+                epoch_budget: None,
+                available_balance: None,
+                denom: None,
             },
         ] {
             let encoded = to_json_binary(&protocol).unwrap();

@@ -189,7 +189,10 @@ jobs:
         env:
           # Rust 1.81 is the last release before reference types became a
           # default Wasm target feature, matching optimizer 0.17.0.
-          RUSTFLAGS: "-C link-arg=--allow-undefined"
+          # Exclude non-executable name/debug metadata from the enforced Wasm
+          # size, matching the repository's standard Wasm build and the
+          # optimizer-produced deployment artifacts.
+          RUSTFLAGS: "-C link-arg=-s -C link-arg=--allow-undefined"
         run: >-
           cargo build --locked --release --lib
           --target wasm32-unknown-unknown

@@ -737,7 +737,12 @@ fn sample_gauge_msgs_cw20() {
     ];
 
     let res: SampleGaugeMsgsResponse = suite
-        .query(&AdapterQueryMsg::SampleGaugeMsgs { selected })
+        .query(&AdapterQueryMsg::SampleGaugeMsgs {
+            selected,
+            epoch_budget: None,
+            available_balance: None,
+            denom: None,
+        })
         .unwrap();
     assert_eq!(res.execute.len(), 3);
     assert_eq!(

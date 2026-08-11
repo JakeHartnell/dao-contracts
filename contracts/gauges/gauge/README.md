@@ -14,7 +14,7 @@ see [`contracts/gauges/README.md`](../README.md) for the bigger picture.
 2. **Vote.** Anyone with nonzero voting power calls `PlaceVotes` with a list
    of `(option, weight)` pairs whose weights sum to ≤ 1.0. The orchestrator
    walks each voter's previous vote and applies a tally diff in one pass.
-3. **Update tallies on stake changes.** The orchestrator is registered as a
+3. **Update tallies on stake changes (hook mode).** The orchestrator is registered as a
    staking hook (cw4 `MemberChangedHook`, cw20 `StakeChangedHook`, cw721
    `NftStakeChangedHook`). When a voter's power changes, every gauge they
    voted on is updated automatically — the user does not have to re-vote.
@@ -29,6 +29,35 @@ see [`contracts/gauges/README.md`](../README.md) for the bigger picture.
    option list can be wiped and refreshed from the adapter on a separate
    cadence — useful for periodically pruning stale options without
    restarting the gauge.
+
+## Epoch-snapshot power mode
+
+`InstantiateMsg.epoch_snapshot` selects an alternative, non-hook power model
+for the entire orchestrator. In this mode `hook_caller` must be empty, every
+gauge must define `snapshot_policy`, and periodic reset is disabled.
+
+Anyone may call `OpenEpoch` once the gauge is due. Opening records the current
+block height, queries a nonzero historical total at exactly that height, and
+copies the adapter's bounded option set into epoch-scoped storage. Every
+ballot then queries the voter's power at that same height. A voter's power is
+fixed on first use for the epoch; revising or removing a ballot cannot change
+the historical value. Full participating power is counted once for turnout,
+while `total_cast` counts only the power actually allocated across options.
+
+At `closes_at`, `Execute` compares participation to `min_turnout_bps` using
+checked integer cross-multiplication. Failed turnout is a terminal,
+no-distribution outcome and does not roll funds into another epoch. Successful
+execution supplies the adapter with the snapshotted epoch budget, current DAO
+balance, and denomination. Epochs expose bounded ballot/allocation/history
+queries and retain their outcome while `CleanupEpoch` removes ballot and
+option working state in batches of at most 100. Ballot-list pages return an
+explicit `next_start_after` scan cursor because an abstaining voter removes its
+active ballot but retains its stable receipt index.
+
+The configured guardian is a stop-only safety authority. It may call
+`StopGauge`, but only the owner may resume, change future-epoch policy, or
+otherwise administer the gauge. All stake/member hooks and vote-hook
+subscriber management are rejected in snapshot mode.
 
 ### Stopping and resuming
 
@@ -92,7 +121,7 @@ Every adapter must answer:
 |---|---|
 | `AllOptions {}` | Initial option seed at gauge attachment. |
 | `CheckOption { option }` | Validates user-proposed additions via `AddOption`. |
-| `SampleGaugeMsgs { selected }` | Returns `Vec<CosmosMsg>` for the orchestrator to dispatch on the DAO's behalf. |
+| `SampleGaugeMsgs { selected, epoch_budget, available_balance, denom }` | Returns `Vec<CosmosMsg>` for the orchestrator to dispatch. Snapshot mode supplies all three budget fields; hook mode leaves them unset for compatibility. |
 
 See [`gauge-adapter/README.md`](../gauge-adapter/README.md) for a worked
 example.
@@ -109,13 +138,12 @@ must enforce it in the adapter and DAO proposal policy.
 
 ### Turnout policy
 
-There is intentionally no minimum turnout or quorum. Selection percentages use
-only `TOTAL_CAST` (power allocated by participating voters), so one low-power
-voter can direct the full epoch allocation when nobody else votes. This favors
-keeper liveness and permits thinly participated gauges, but exposes budgets to
-low-turnout capture. DAOs that do not accept that economic risk should not fund
-the gauge until an audited adapter or orchestrator version enforces an explicit
-turnout threshold.
+Hook mode intentionally has no minimum turnout or quorum. Selection percentages
+use only `TOTAL_CAST`, so deployments must accept its low-turnout risk.
+Epoch-snapshot mode instead requires an explicit `min_turnout_bps` policy and
+uses the historical total-power snapshot as its denominator. A partial ballot
+still counts the voter's full fixed power toward turnout, while unallocated
+weight remains unspent.
 
 ## Voting power edge cases
 
@@ -142,6 +170,8 @@ Key collections (see `state.rs`):
   top-N selection.
 - `TOTAL_CAST: Map<GaugeId, u128>` — denominator for percent math.
 - `votes()` — indexed map keyed `(voter, gauge_id) → Vote`.
+- `EPOCHS`, `EPOCH_BALLOTS`, and `EPOCH_TALLY` — historical-height metadata,
+  receipts, and allocations scoped by `(gauge_id, epoch_id)` in snapshot mode.
 
 ### Health and reconciliation
 

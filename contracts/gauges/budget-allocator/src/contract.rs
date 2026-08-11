@@ -144,7 +144,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             to_json_binary(&all_options(deps, start_after, limit)?)
         }
         QueryMsg::CheckOption { option } => to_json_binary(&check_option(deps, option)),
-        QueryMsg::SampleGaugeMsgs { selected } => {
+        QueryMsg::SampleGaugeMsgs { selected, .. } => {
             to_json_binary(&sample_gauge_msgs(deps, selected)?)
         }
         QueryMsg::Ownership {} => to_json_binary(&cw_ownable::get_ownership(deps.storage)?),
@@ -160,7 +160,7 @@ pub fn answer_adapter(deps: Deps, msg: AdapterQueryMsg) -> StdResult<Binary> {
             to_json_binary(&all_options(deps, start_after, limit)?)
         }
         AdapterQueryMsg::CheckOption { option } => to_json_binary(&check_option(deps, option)),
-        AdapterQueryMsg::SampleGaugeMsgs { selected } => {
+        AdapterQueryMsg::SampleGaugeMsgs { selected, .. } => {
             to_json_binary(&sample_gauge_msgs(deps, selected)?)
         }
     }

@@ -17,6 +17,51 @@ pub enum ContractError {
     #[error("Unauthorized")]
     Unauthorized {},
 
+    #[error("Power-change hooks are disabled in epoch-snapshot mode")]
+    HooksDisabledInSnapshotMode {},
+
+    #[error("This operation requires epoch-snapshot mode")]
+    SnapshotModeRequired {},
+
+    #[error("Snapshot policy is required in epoch-snapshot mode and forbidden in hook mode")]
+    InvalidSnapshotPolicy {},
+
+    #[error("Snapshot turnout basis points must be at most 10000")]
+    InvalidTurnoutBps {},
+
+    #[error("Snapshot epoch budget and native denomination must be nonzero")]
+    InvalidEpochBudget {},
+
+    #[error("Snapshot epoch {epoch} for gauge {gauge} is not open")]
+    EpochNotOpen { gauge: u64, epoch: u64 },
+
+    #[error("Gauge {0} already has an open snapshot epoch")]
+    EpochAlreadyOpen(u64),
+
+    #[error("Snapshot epoch voting closes at {closes_at}; current time is {current}")]
+    SnapshotVotingClosed { closes_at: u64, current: u64 },
+
+    #[error("Snapshot epoch voting remains open until {closes_at}; current time is {current}")]
+    SnapshotVotingOpen { closes_at: u64, current: u64 },
+
+    #[error("Historical total voting power at height {height} is zero")]
+    ZeroSnapshotTotalPower { height: u64 },
+
+    #[error("Voting module answered snapshot height {actual}; expected {expected}")]
+    SnapshotHeightMismatch { expected: u64, actual: u64 },
+
+    #[error("Snapshot height or schedule arithmetic overflowed")]
+    SnapshotArithmetic {},
+
+    #[error("Snapshot epoch cleanup limit must be between 1 and 100")]
+    InvalidCleanupLimit {},
+
+    #[error("Snapshot epoch is not terminal")]
+    EpochNotTerminal {},
+
+    #[error("Gauge {gauge_id} selection configuration is locked while a snapshot epoch is open")]
+    SnapshotGaugeConfigLocked { gauge_id: u64 },
+
     #[error("Gauge with ID {0} does not exists")]
     GaugeMissing(u64),
 

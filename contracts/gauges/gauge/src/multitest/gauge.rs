@@ -205,6 +205,8 @@ fn create_gauge() {
             is_stopped: false,
             next_epoch: suite.current_time() + 7 * 86400,
             reset: None,
+            snapshot_policy: None,
+            current_epoch: None,
         }
     );
 }
@@ -246,6 +248,8 @@ fn gauge_can_upgrade_from_older_version() {
             is_stopped: false,
             next_epoch: suite.current_time() + 7 * 86400,
             reset: None,
+            snapshot_policy: None,
+            current_epoch: None,
         }
     );
 }
@@ -284,6 +288,8 @@ fn gauge_migrate_with_next_epochs() {
             is_stopped: false,
             next_epoch: suite.current_time() + 7 * 86400,
             reset: None,
+            snapshot_policy: None,
+            current_epoch: None,
         }
     );
 
@@ -317,6 +323,8 @@ fn gauge_migrate_with_next_epochs() {
             is_stopped: false,
             next_epoch: suite.current_time() + 14 * 86400,
             reset: None,
+            snapshot_policy: None,
+            current_epoch: None,
         }
     );
 
@@ -927,6 +935,8 @@ fn update_gauge() {
                 is_stopped: false,
                 next_epoch: suite.current_time() + 7 * 86400,
                 reset: None,
+                snapshot_policy: None,
+                current_epoch: None,
             },
             GaugeResponse {
                 id: 1,
@@ -939,6 +949,8 @@ fn update_gauge() {
                 is_stopped: false,
                 next_epoch: suite.current_time() + 7 * 86400,
                 reset: None,
+                snapshot_policy: None,
+                current_epoch: None,
             }
         ]
     );
@@ -976,6 +988,8 @@ fn update_gauge() {
                 is_stopped: false,
                 next_epoch: suite.current_time() + 7 * 86400,
                 reset: None,
+                snapshot_policy: None,
+                current_epoch: None,
             },
             GaugeResponse {
                 id: 1,
@@ -988,6 +1002,8 @@ fn update_gauge() {
                 is_stopped: false,
                 next_epoch: suite.current_time() + 7 * 86400,
                 reset: None,
+                snapshot_policy: None,
+                current_epoch: None,
             }
         ]
     );
@@ -1020,6 +1036,8 @@ fn update_gauge() {
                 is_stopped: false,
                 next_epoch: suite.current_time() + 7 * 86400,
                 reset: None,
+                snapshot_policy: None,
+                current_epoch: None,
             },
             GaugeResponse {
                 id: 1,
@@ -1032,6 +1050,8 @@ fn update_gauge() {
                 is_stopped: false,
                 next_epoch: suite.current_time() + 7 * 86400,
                 reset: None,
+                snapshot_policy: None,
+                current_epoch: None,
             }
         ]
     );

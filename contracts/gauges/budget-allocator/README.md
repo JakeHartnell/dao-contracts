@@ -26,7 +26,8 @@ etc.). The contract is ~150 lines of logic — fork it freely.
    new options via `ExecuteMsg::AddOption` upstream — those proposals
    need to match the owner-curated list here.
 4. **Execute.** At epoch close the orchestrator queries
-   `SampleGaugeMsgs { selected }`, which returns `BankMsg::Send` payouts
+   `SampleGaugeMsgs { selected, epoch_budget, available_balance, denom }`,
+   which returns `BankMsg::Send` payouts
    for each `(recipient, weight)` pair sized as
    `epoch_budget.amount * weight` (floor).
 
@@ -46,7 +47,7 @@ etc.). The contract is ~150 lines of logic — fork it freely.
 | `Config {}` | `Config { epoch_budget }` | Inspect deployed parameters. |
 | `AllOptions {}` | `AllOptionsResponse` | Used by the orchestrator on attach. |
 | `CheckOption { option }` | `CheckOptionResponse` | Used by the orchestrator on `AddOption`. |
-| `SampleGaugeMsgs { selected }` | `SampleGaugeMsgsResponse` | Translates a selected set into payouts. |
+| `SampleGaugeMsgs { selected, epoch_budget, available_balance, denom }` | `SampleGaugeMsgsResponse` | Translates a selected set into payouts. Optional context is accepted for protocol compatibility; this adapter uses its configured budget. |
 | `Ownership {}` | `cw_ownable::Ownership<Addr>` | Current owner + any pending transfer. |
 
 ## Errors

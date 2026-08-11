@@ -1210,6 +1210,7 @@ fn real_native_staked_module_updates_gauge_through_registered_hook() {
             &InstantiateMsg {
                 voting_powers: voting.to_string(),
                 hook_caller: voting.to_string(),
+                epoch_snapshot: None,
                 owner: owner.to_owned(),
                 gauges: None,
             },
@@ -1402,6 +1403,7 @@ fn real_cw20_staked_module_updates_gauge_through_registered_hook() {
             &InstantiateMsg {
                 voting_powers: voting.to_string(),
                 hook_caller: staking.to_string(),
+                epoch_snapshot: None,
                 owner: owner.to_owned(),
                 gauges: None,
             },
@@ -1788,6 +1790,7 @@ fn real_cw721_staked_module_updates_gauge_through_registered_hook() {
             &InstantiateMsg {
                 voting_powers: voting.to_string(),
                 hook_caller: voting.to_string(),
+                epoch_snapshot: None,
                 owner: owner.to_owned(),
                 gauges: None,
             },

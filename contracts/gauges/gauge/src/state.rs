@@ -5,7 +5,7 @@ use cw_storage_plus::{Bound, Index, IndexList, IndexedMap, Item, Map, MultiIndex
 use cw_utils::maybe_addr;
 
 use crate::error::ContractError;
-use crate::msg::VoteInfo;
+use crate::msg::{CleanupProgress, EpochOutcome, EpochResponse, EpochSnapshotPolicy, VoteInfo};
 
 /// Type alias for u64 to make the map types a bit more self-explanatory
 pub type GaugeId = u64;
@@ -25,6 +25,86 @@ pub const NEXT_VOTE_HOOK_REPLY_ID: Item<u64> = Item::new("next_vote_hook_reply_i
 /// `last == next` marker records that a reset is active; this cursor ensures
 /// later batches never revisit options already rewritten to zero.
 pub const RESET_CURSOR: Map<GaugeId, String> = Map::new("reset_cursor");
+
+#[cw_serde]
+pub enum PowerSource {
+    Hook,
+    EpochSnapshot { guardian: Addr },
+}
+
+pub const POWER_SOURCE: Item<PowerSource> = Item::new("power_source");
+pub const SNAPSHOT_POLICIES: Map<GaugeId, EpochSnapshotPolicy> = Map::new("snapshot_policies");
+pub const CURRENT_EPOCH: Map<GaugeId, u64> = Map::new("current_epoch");
+pub const NEXT_EPOCH_ID: Map<GaugeId, u64> = Map::new("next_epoch_id");
+
+#[cw_serde]
+pub struct SnapshotEpoch {
+    pub gauge_id: GaugeId,
+    pub epoch_id: u64,
+    pub snapshot_height: u64,
+    pub snapshot_total_power: Uint128,
+    pub participating_power: Uint128,
+    pub total_cast: Uint128,
+    pub min_turnout_bps: u16,
+    pub epoch_budget: Uint128,
+    pub denom: String,
+    pub opens_at: u64,
+    pub closes_at: u64,
+    pub voter_count: u32,
+    pub receipt_count: u32,
+    pub option_count: u32,
+    pub outcome: EpochOutcome,
+    pub cleanup: CleanupProgress,
+}
+
+impl SnapshotEpoch {
+    pub fn response(&self) -> EpochResponse {
+        EpochResponse {
+            gauge_id: self.gauge_id,
+            epoch_id: self.epoch_id,
+            snapshot_height: self.snapshot_height,
+            snapshot_total_power: self.snapshot_total_power,
+            participating_power: self.participating_power,
+            total_cast: self.total_cast,
+            min_turnout_bps: self.min_turnout_bps,
+            epoch_budget: self.epoch_budget,
+            denom: self.denom.clone(),
+            opens_at: self.opens_at,
+            closes_at: self.closes_at,
+            voter_count: self.voter_count,
+            option_count: self.option_count,
+            outcome: self.outcome.clone(),
+            cleanup: self.cleanup.clone(),
+        }
+    }
+}
+
+#[cw_serde]
+pub struct SnapshotBallot {
+    pub voter: Addr,
+    pub power: Uint128,
+    pub votes: Vec<Vote>,
+    pub cast_at: u64,
+    pub revised_at: u64,
+    pub revisions: u32,
+    pub receipt_index: u32,
+}
+
+pub const EPOCHS: Map<(GaugeId, u64), SnapshotEpoch> = Map::new("snapshot_epochs");
+pub const EPOCH_OPTIONS: Map<(GaugeId, u64, &str), ()> = Map::new("snapshot_epoch_options");
+pub const EPOCH_OPTION_INDEX: Map<(GaugeId, u64, u32), String> =
+    Map::new("snapshot_epoch_option_index");
+pub const EPOCH_TALLY: Map<(GaugeId, u64, &str), u128> = Map::new("snapshot_epoch_tally");
+pub const EPOCH_BALLOTS: Map<(GaugeId, u64, &Addr), SnapshotBallot> =
+    Map::new("snapshot_epoch_ballots");
+pub const EPOCH_BALLOT_INDEX: Map<(GaugeId, u64, u32), Addr> =
+    Map::new("snapshot_epoch_ballot_index");
+pub const EPOCH_BALLOT_SEEN: Map<(GaugeId, u64, &Addr), bool> =
+    Map::new("snapshot_epoch_ballot_seen");
+pub const EPOCH_BALLOT_POSITION: Map<(GaugeId, u64, &Addr), u32> =
+    Map::new("snapshot_epoch_ballot_position");
+pub const EPOCH_VOTER_POWER: Map<(GaugeId, u64, &Addr), Uint128> =
+    Map::new("snapshot_epoch_voter_power");
 
 /// Get ID for gauge registration and increment value in storage
 pub fn fetch_last_id(storage: &mut dyn Storage) -> StdResult<u64> {

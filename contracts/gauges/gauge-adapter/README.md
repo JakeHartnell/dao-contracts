@@ -35,8 +35,11 @@ implementing the three `AdapterQueryMsg` variants.
    for the option set and `CheckOption` for user-added options.
 
 4. **Execute.** At epoch close, the orchestrator queries
-   `SampleGaugeMsgs { selected }` (where `selected` is `Vec<(address,
-   Decimal)>` with weights summing to ≤1.0). The adapter returns
+   `SampleGaugeMsgs { selected, epoch_budget, available_balance, denom }`
+   (where `selected` is `Vec<(address, Decimal)>` with weights summing to
+   ≤1.0). Hook-mode orchestrators leave the three budget-context fields unset;
+   snapshot-mode orchestrators supply them. This legacy adapter continues to
+   use its configured reward policy. It returns
    `Vec<CosmosMsg>` — one transfer per recipient, native or cw20 depending
    on how `reward` was configured.
 
@@ -61,7 +64,7 @@ implementing the three `AdapterQueryMsg` variants.
 | `Config {}` | `Config` | Inspect the deployed parameters. |
 | `AllOptions {}` | `AllOptionsResponse` | Used by the orchestrator on gauge attach. |
 | `CheckOption { option }` | `CheckOptionResponse { valid: bool }` | Used by the orchestrator when a voter calls `AddOption`. |
-| `SampleGaugeMsgs { selected }` | `SampleGaugeMsgsResponse { execute: Vec<CosmosMsg> }` | Translates a selected set into payout messages. |
+| `SampleGaugeMsgs { selected, epoch_budget, available_balance, denom }` | `SampleGaugeMsgsResponse { execute: Vec<CosmosMsg> }` | Translates a selected set into payout messages; optional context supports snapshot orchestrators. |
 | `Submission { address }` | `SubmissionResponse` | Read a single submission. |
 | `AllSubmissions { start_after, limit }` | `AllSubmissionsResponse` | Paginated submissions, capped at 100 rows. |
 | `SubmissionsBySender { sender, start_after, limit }` | `AllSubmissionsResponse` | Paginated sender-index lookup, capped at 100 rows. |

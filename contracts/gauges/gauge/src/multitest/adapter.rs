@@ -76,7 +76,7 @@ fn query(deps: Deps, _env: Env, msg: AdapterQueryMsg) -> Result<Binary, StdError
         AdapterQueryMsg::CheckOption { option } => to_json_binary(&CheckOptionResponse {
             valid: OPTIONS.has(deps.storage, option),
         }),
-        AdapterQueryMsg::SampleGaugeMsgs { selected } => {
+        AdapterQueryMsg::SampleGaugeMsgs { selected, .. } => {
             if RETURN_EMPTY.load(deps.storage)? {
                 return to_json_binary(&SampleGaugeMsgsResponse { execute: vec![] });
             }

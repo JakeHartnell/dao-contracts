@@ -44,7 +44,7 @@ docker create \
     wasm-opt --version >> /out/build-tools.txt
     cd /code
     export CARGO_TARGET_DIR=/target
-    export RUSTFLAGS="-C link-arg=--allow-undefined"
+    export RUSTFLAGS="-C link-arg=-s -C link-arg=--allow-undefined"
     cargo +1.81.0 build --locked --release --lib \
       --target wasm32-unknown-unknown \
       -p gauge-orchestrator \
