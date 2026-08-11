@@ -81,6 +81,9 @@ pub enum QueryMsg {
         /// Option along with weight.
         /// Sum of all weights should be 1.0 (within rounding error).
         selected: Vec<(String, Decimal)>,
+        epoch_budget: Option<Uint128>,
+        available_balance: Option<Uint128>,
+        denom: Option<String>,
     },
 
     // Marketing-gauge specific queries to help on frontend
@@ -162,6 +165,9 @@ mod schema_smoke_tests {
             },
             AdapterQueryMsg::SampleGaugeMsgs {
                 selected: vec![("recipient".to_owned(), Decimal::percent(50))],
+                epoch_budget: None,
+                available_balance: None,
+                denom: None,
             },
         ] {
             let encoded = to_json_binary(&protocol).unwrap();

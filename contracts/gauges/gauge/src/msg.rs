@@ -16,6 +16,9 @@ pub struct InstantiateMsg {
     pub voting_powers: String,
     /// Addres that will call voting power change hooks (often same as voting power contract)
     pub hook_caller: String,
+    /// When set, hooks are disabled and every gauge uses one historical
+    /// voting-power snapshot per explicitly opened epoch.
+    pub epoch_snapshot: Option<EpochSnapshotModeConfig>,
     /// Address that can add new gauges or stop them
     pub owner: String,
     /// Allow attaching multiple adaptors during instantiation.
@@ -42,6 +45,27 @@ pub struct GaugeConfig {
     pub max_available_percentage: Option<Decimal>,
     /// If set, the gauge can be reset periodically, every `reset_epoch` seconds.
     pub reset_epoch: Option<u64>,
+    /// Required in epoch-snapshot mode and rejected in hook mode.
+    pub snapshot_policy: Option<EpochSnapshotPolicy>,
+}
+
+#[cw_serde]
+pub struct EpochSnapshotModeConfig {
+    /// Stop-only safety authority. Only the owner may resume.
+    pub guardian: String,
+}
+
+#[cw_serde]
+pub struct EpochSnapshotPolicy {
+    pub min_turnout_bps: u16,
+    pub epoch_budget: Uint128,
+    pub denom: String,
+}
+
+#[cw_serde]
+pub enum PowerSourceResponse {
+    Hook { hook_caller: String },
+    EpochSnapshot { guardian: String },
 }
 
 #[cw_serde]
@@ -70,6 +94,15 @@ pub enum ExecuteMsg {
     StopGauge { gauge: u64 },
     /// Owner-only: resumes voting, reset, and epoch execution for a stopped gauge.
     ResumeGauge { gauge: u64 },
+    /// Publicly opens the next epoch at one historical power height.
+    OpenEpoch { gauge: u64 },
+    /// Owner-only future-epoch policy update.
+    UpdateSnapshotPolicy {
+        gauge: u64,
+        policy: EpochSnapshotPolicy,
+    },
+    /// Public bounded cleanup of one terminal epoch.
+    CleanupEpoch { gauge: u64, epoch: u64, limit: u32 },
     /// Resets all votes on a given gauge if it is configured to be periodically reset and the epoch has passed.
     /// One call to this will only clear `batch_size` votes to prevent gas exhaustion. Call repeatedly to clear all votes.
     ResetGauge { gauge: u64, batch_size: u32 },
@@ -148,6 +181,34 @@ pub enum QueryMsg {
     /// List the currently-registered `GaugeVoteHook` subscribers.
     #[returns(GetHooksResponse)]
     GetHooks {},
+    #[returns(EpochResponse)]
+    Epoch { gauge: u64, epoch: u64 },
+    #[returns(ListEpochsResponse)]
+    ListEpochs {
+        gauge: u64,
+        start_after: Option<u64>,
+        limit: Option<u32>,
+    },
+    #[returns(EpochBallotResponse)]
+    EpochBallot {
+        gauge: u64,
+        epoch: u64,
+        voter: String,
+    },
+    #[returns(ListEpochBallotsResponse)]
+    ListEpochBallots {
+        gauge: u64,
+        epoch: u64,
+        start_after: Option<u32>,
+        limit: Option<u32>,
+    },
+    #[returns(EpochAllocationsResponse)]
+    EpochAllocations {
+        gauge: u64,
+        epoch: u64,
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
 }
 
 #[cw_serde]
@@ -156,6 +217,7 @@ pub struct ConfigResponse {
     pub dao_core: String,
     pub voting_powers: String,
     pub hook_caller: String,
+    pub power_source: PowerSourceResponse,
 }
 
 #[cw_serde]
@@ -187,6 +249,85 @@ pub struct GaugeResponse {
     pub next_epoch: u64,
     /// Set this in migration if the gauge should be periodically reset
     pub reset: Option<Reset>,
+    pub snapshot_policy: Option<EpochSnapshotPolicy>,
+    pub current_epoch: Option<u64>,
+}
+
+#[cw_serde]
+pub enum EpochOutcome {
+    Open,
+    Distributed { message_count: u32 },
+    NoDistributionTurnout,
+    NoEligibleOptions,
+}
+
+#[cw_serde]
+pub enum CleanupPhase {
+    Ballots,
+    Options,
+    Complete,
+}
+
+#[cw_serde]
+pub struct CleanupProgress {
+    pub phase: CleanupPhase,
+    pub cursor: u32,
+    pub complete: bool,
+}
+
+#[cw_serde]
+pub struct EpochResponse {
+    pub gauge_id: u64,
+    pub epoch_id: u64,
+    pub snapshot_height: u64,
+    pub snapshot_total_power: Uint128,
+    pub participating_power: Uint128,
+    pub total_cast: Uint128,
+    pub min_turnout_bps: u16,
+    pub epoch_budget: Uint128,
+    pub denom: String,
+    pub opens_at: u64,
+    pub closes_at: u64,
+    pub voter_count: u32,
+    pub option_count: u32,
+    pub outcome: EpochOutcome,
+    pub cleanup: CleanupProgress,
+}
+
+#[cw_serde]
+pub struct ListEpochsResponse {
+    pub epochs: Vec<EpochResponse>,
+}
+
+#[cw_serde]
+pub struct EpochBallotInfo {
+    pub voter: String,
+    pub power: Uint128,
+    pub votes: Vec<Vote>,
+    pub cast_at: u64,
+    pub revised_at: u64,
+    pub revisions: u32,
+    /// Stable, epoch-scoped cursor assigned on the voter's first ballot.
+    pub receipt_index: u32,
+}
+
+#[cw_serde]
+pub struct EpochBallotResponse {
+    pub ballot: Option<EpochBallotInfo>,
+}
+
+#[cw_serde]
+pub struct ListEpochBallotsResponse {
+    pub ballots: Vec<EpochBallotInfo>,
+    /// Last scanned receipt index when another bounded page remains. A page
+    /// can contain fewer ballots than `limit` because abstentions remove the
+    /// active ballot while retaining its stable index.
+    pub next_start_after: Option<u32>,
+}
+
+#[cw_serde]
+pub struct EpochAllocationsResponse {
+    pub allocations: Vec<(String, Uint128)>,
 }
 
 /// Information about one gauge

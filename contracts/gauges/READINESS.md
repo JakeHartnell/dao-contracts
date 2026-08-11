@@ -4,6 +4,24 @@ Status date: 2026-07-14. This document classifies the current working tree
 against `GOAL.md`; it is not a production approval or security audit.
 The direct evidence map is [`GOAL-AUDIT.md`](./GOAL-AUDIT.md).
 
+Update (2026-08-05): the epoch-snapshot power mode added after this readiness
+review has focused unit, randomized-model, migration, compatibility, package,
+schema, and release-build checks. The independent audit, maximum-path gas,
+optimized-artifact chain exercise, and public-testnet evidence below do not yet
+cover that extension. Nothing in this document should be read as production
+approval for the new mode until those gates are recorded.
+
+The dirty-tree Rust 1.81 validation build (linker metadata stripped, not the
+optimizer-built release) passed `cosmwasm-check 1.5.11`, Wasm validation, the
+800,000-byte cap, and exact export checks: orchestrator
+`ea49e9b80c8432892c895c30911a081f1523b5ecd19814f2ebe1efff9fae38d4`
+(758,956 bytes), marketing adapter
+`09d23451af9d676c18499eef75c9a8d6aae058d6ce797329d75831dd54891414`
+(416,411 bytes), and allocator
+`d7663e3de952e5fbf1e056bc8cdb7532366d6e65cac94a988a6a1faece67a2bc`
+(265,656 bytes). These checksums are diagnostic only and must be reproduced
+from the clean reviewed commit before release.
+
 ## Locally verified
 
 - Vote inputs reject duplicate, empty, zero-weight, oversized, over-100%,

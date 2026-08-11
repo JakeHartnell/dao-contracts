@@ -38,6 +38,12 @@ overflow-checks = true
 [profile.release.package.cw-protobuf-registry]
 opt-level = "z"
 
+# The orchestrator now carries two complete power-accounting modes. Keep its
+# deployable Wasm under the repository limit; target-chain gas at configured
+# maxima remains an independent production-evidence gate.
+[profile.release.package.gauge-orchestrator]
+opt-level = "z"
+
 [workspace.dependencies]
 anyhow = { version = "1.0" }
 assert_matches = "1.5"

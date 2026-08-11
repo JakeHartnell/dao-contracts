@@ -551,7 +551,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
             to_json_binary(&query::all_options(deps, start_after, limit)?)
         }
         QueryMsg::CheckOption { option } => to_json_binary(&query::check_option(deps, option)?),
-        QueryMsg::SampleGaugeMsgs { selected } => {
+        QueryMsg::SampleGaugeMsgs { selected, .. } => {
             to_json_binary(&query::sample_gauge_msgs(deps, selected)?)
         }
         QueryMsg::Submission { address } => to_json_binary(&query::submission(deps, address)?),

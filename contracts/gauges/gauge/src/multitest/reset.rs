@@ -231,6 +231,8 @@ fn gauge_migrate_with_reset() {
             is_stopped: false,
             next_epoch: suite.current_time() + 7 * 86400,
             reset: None,
+            snapshot_policy: None,
+            current_epoch: None,
         }
     );
 
@@ -296,6 +298,8 @@ fn gauge_migrate_with_reset() {
                 reset_each: RESET_EPOCH,
                 next: suite.current_time() + 100,
             }),
+            snapshot_policy: None,
+            current_epoch: None,
         }
     );
 }

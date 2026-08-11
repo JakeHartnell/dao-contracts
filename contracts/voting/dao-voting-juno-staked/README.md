@@ -74,10 +74,11 @@ no user execute operations. Its standard DAO DAO query surface is:
 - `Dao` (the DAO core that instantiated this voting module)
 - `Info`
 
-The release-candidate workflow has been exercised on Juno v30 `uni-7`: store,
-instantiate, all four DAO DAO queries, and voter/total-power behavior across a
-real staking change and EndBlock boundary. Release operators must still bind
-that smoke evidence to the exact artifact checksum they intend to deploy.
+The release-candidate workflow has not yet been exercised on public `uni-7`.
+Before release, operators must store and instantiate the exact candidate,
+exercise all four DAO DAO queries, prove voter/total-power behavior across a
+real staking change and EndBlock boundary, and bind that evidence to the exact
+artifact checksum.
 
 ## Why staking-delta hooks are not exposed
 

@@ -218,7 +218,12 @@ fn sample_gauge_msgs_distributes_proportionally() {
     ];
 
     let res: SampleGaugeMsgsResponse = suite
-        .query(&QueryMsg::SampleGaugeMsgs { selected })
+        .query(&QueryMsg::SampleGaugeMsgs {
+            selected,
+            epoch_budget: None,
+            available_balance: None,
+            denom: None,
+        })
         .unwrap();
     assert_eq!(res.execute.len(), 3);
     assert_eq!(
@@ -251,7 +256,12 @@ fn sample_gauge_msgs_floors_when_weight_does_not_divide_evenly() {
         ("carol".to_string(), third),
     ];
     let res: SampleGaugeMsgsResponse = suite
-        .query(&QueryMsg::SampleGaugeMsgs { selected })
+        .query(&QueryMsg::SampleGaugeMsgs {
+            selected,
+            epoch_budget: None,
+            available_balance: None,
+            denom: None,
+        })
         .unwrap();
     for msg in &res.execute {
         match msg {

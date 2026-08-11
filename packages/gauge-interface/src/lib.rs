@@ -1,5 +1,5 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{CosmosMsg, Decimal, StdError, StdResult};
+use cosmwasm_std::{CosmosMsg, Decimal, StdError, StdResult, Uint128};
 use std::collections::HashSet;
 
 /// Minimal protocol every gauge adapter implements.
@@ -20,6 +20,11 @@ pub enum AdapterQueryMsg {
         /// Option keys must be unique and nonempty, every share must be
         /// positive, and the total must not exceed one.
         selected: Vec<(String, Decimal)>,
+        /// Explicit budget context for epoch-snapshot gauges. Hook-mode
+        /// callers leave these fields unset and retain legacy adapter policy.
+        epoch_budget: Option<Uint128>,
+        available_balance: Option<Uint128>,
+        denom: Option<String>,
     },
 }
 

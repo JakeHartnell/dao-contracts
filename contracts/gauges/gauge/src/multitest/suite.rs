@@ -590,6 +590,7 @@ impl Suite {
                         msg: to_json_binary(&InstantiateMsg {
                             voting_powers: self.voting.to_string(),
                             hook_caller: self.group_contract.to_string(),
+                            epoch_snapshot: None,
                             owner: self.owner.clone(),
                             gauges: gauge_config.into(),
                         })?,
@@ -632,6 +633,7 @@ impl Suite {
                         msg: to_json_binary(&InstantiateMsg {
                             voting_powers: self.voting.to_string(),
                             hook_caller: Addr::unchecked(hook_caller).to_string(),
+                            epoch_snapshot: None,
                             owner: self.owner.clone(),
                             gauges: gauge_config.into(),
                         })?,
@@ -752,6 +754,7 @@ impl Suite {
             max_options_selected: 10,
             max_available_percentage: max_available_percentage.into(),
             reset_epoch: reset_epoch.into(),
+            snapshot_policy: None,
         })
     }
 
